@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "xenia/ui/immediate_drawer.h"
@@ -22,6 +24,7 @@
 #include "xenia/ui/window_listener.h"
 
 struct ImDrawData;
+struct ImFont;
 struct ImGuiContext;
 struct ImGuiIO;
 enum ImGuiKey : int;
@@ -52,6 +55,19 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   }
 
   void Draw(UIDrawContext& ui_draw_context) override;
+
+  // Large smooth font for full-screen menus, or null if unavailable (then use
+  // the default font).
+  ImFont* ui_font() const { return ui_font_; }
+
+  // Textures for ImGui images (usable as ImTextureID), owned here rather than
+  // by callers because they belong to the current immediate drawer and are
+  // dropped whenever it changes - so callers keep their own pixels, look the
+  // texture up by key every frame, and recreate it on a miss. Both return
+  // null when there's nothing to draw with.
+  void* GetUserTexture(const std::string& key) const;
+  void* CreateUserTexture(const std::string& key, uint32_t width,
+                          uint32_t height, const uint8_t* rgba);
 
  protected:
   void OnKeyDown(KeyEvent& e) override;
@@ -85,6 +101,7 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   size_t z_order_;
 
   ImGuiContext* internal_state_ = nullptr;
+  ImFont* ui_font_ = nullptr;
 
   // All currently-attached dialogs that get drawn.
   std::vector<ImGuiDialog*> dialogs_;
@@ -100,6 +117,8 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // Resources specific to an immediate drawer - must be destroyed before
   // detaching the presenter.
   std::unique_ptr<ImmediateTexture> font_texture_;
+  std::unordered_map<std::string, std::unique_ptr<ImmediateTexture>>
+      user_textures_;
 
   // If there's an active pointer, the ImGui mouse is controlled by this touch.
   // If it's TouchEvent::kPointerIDNone, the ImGui mouse is controlled by the

@@ -137,6 +137,15 @@ class XexModule : public xe::cpu::Module {
 
   static const void* GetSecurityInfo(const xex2_header* header);
 
+  // Decrypts/decompresses an XEX2's PE image into a plain host buffer rather
+  // than guest memory - no Processor, Memory or title needed - so tools like
+  // the dashboard can read resources (title name, icon) out of games that
+  // aren't running. Tries the retail key, then the devkit key. `image` gets
+  // the image as it would be laid out at `*base_address`.
+  static bool DecodeImageToHost(const void* xex_addr, size_t xex_length,
+                                std::vector<uint8_t>* image,
+                                uint32_t* base_address);
+
   const PESection* GetPESection(const char* name);
 
   uint32_t GetProcAddress(uint16_t ordinal) const;

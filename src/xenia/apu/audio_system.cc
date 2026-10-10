@@ -226,6 +226,15 @@ void AudioSystem::UnregisterClient(size_t index) {
   assert_true(wait_result == xe::threading::WaitResult::kTimeout);
 }
 
+void AudioSystem::UnregisterGuestClients() {
+  auto global_lock = global_critical_region_.Acquire();
+  for (size_t i = 0; i < kMaximumClientCount; ++i) {
+    if (clients_[i].in_use && clients_[i].callback) {
+      UnregisterClient(i);
+    }
+  }
+}
+
 bool AudioSystem::Save(ByteStream* stream) {
   stream->Write(kAudioSaveSignature);
 

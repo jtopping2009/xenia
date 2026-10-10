@@ -9,13 +9,18 @@
 
 #include "xenia/kernel/kernel_state.h"
 
+#include <array>
+#include <chrono>
 #include <string>
+#include <vector>
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/string.h"
+#include "xenia/cpu/backend/backend.h"
+#include "xenia/cpu/backend/code_cache.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/user_module.h"
@@ -27,6 +32,10 @@
 #include "xenia/kernel/xnotifylistener.h"
 #include "xenia/kernel/xobject.h"
 #include "xenia/kernel/xthread.h"
+
+#if XE_PLATFORM_WIN32
+#include "xenia/base/platform_win.h"
+#endif
 
 namespace xe {
 namespace kernel {
@@ -484,6 +493,133 @@ void KernelState::UnloadUserModule(const object_ref<UserModule>& module,
                            }) == user_modules_.end());
 
   object_table()->ReleaseHandle(module->handle());
+}
+
+#if XE_PLATFORM_WIN32
+namespace {
+// Whether a suspended thread is somewhere it's safe to kill: executing
+// translated guest code (which takes no host locks itself), or parked in an
+// ntdll wait syscall (which covers blocking on the global lock we hold, on
+// kernel objects, and sleeps).
+bool IsThreadAtKillSafePoint(HANDLE thread, uintptr_t code_begin,
+                             uintptr_t code_end) {
+  CONTEXT context = {};
+  context.ContextFlags = CONTEXT_CONTROL;
+  if (!GetThreadContext(thread, &context)) {
+    return false;
+  }
+  uintptr_t pc = uintptr_t(context.Rip);
+  if (pc >= code_begin && pc < code_end) {
+    return true;
+  }
+  static const std::array<uintptr_t, 7> wait_stubs = [] {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    auto stub = [ntdll](const char* name) {
+      return ntdll ? uintptr_t(GetProcAddress(ntdll, name)) : uintptr_t(0);
+    };
+    return std::array<uintptr_t, 7>{
+        stub("NtWaitForSingleObject"),   stub("NtWaitForMultipleObjects"),
+        stub("NtDelayExecution"),        stub("NtWaitForAlertByThreadId"),
+        stub("NtRemoveIoCompletion"),    stub("NtSignalAndWaitForSingleObject"),
+        stub("NtWaitForKeyedEvent")};
+  }();
+  // A thread blocked in a syscall sits just past the `syscall` instruction
+  // inside its ~0x20-byte stub.
+  for (uintptr_t stub : wait_stubs) {
+    if (stub && pc >= stub && pc < stub + 0x20) {
+      return true;
+    }
+  }
+  return false;
+}
+}  // namespace
+#endif  // XE_PLATFORM_WIN32
+
+bool KernelState::TerminateTitleSafely() {
+#if XE_PLATFORM_WIN32
+  XELOGI("KernelState::TerminateTitleSafely");
+  // While this is held no other thread is inside kernel code that takes it,
+  // and any thread that tries to ends up in a wait - a safe point.
+  auto global_lock = global_critical_region_.Acquire();
+
+  std::vector<XThread*> threads;
+  for (auto& it : threads_by_id_) {
+    XThread* thread = it.second;
+    if (!XThread::IsInThread(thread) && thread->is_guest_thread() &&
+        thread->is_running()) {
+      threads.push_back(thread);
+    }
+  }
+  for (XThread* thread : threads) {
+    thread->thread()->Suspend();
+  }
+
+  auto code_cache = processor()->backend()->code_cache();
+  uintptr_t code_begin = code_cache->execute_base_address();
+  uintptr_t code_end = code_begin + code_cache->total_size();
+  // Let threads caught mid-way through host code run on briefly until they
+  // reach a safe point.
+  std::vector<XThread*> unsafe = threads;
+  for (int attempt = 0; attempt < 400 && !unsafe.empty(); ++attempt) {
+    std::vector<XThread*> still_unsafe;
+    for (XThread* thread : unsafe) {
+      if (!IsThreadAtKillSafePoint(HANDLE(thread->thread()->native_handle()),
+                                   code_begin, code_end)) {
+        still_unsafe.push_back(thread);
+      }
+    }
+    unsafe = std::move(still_unsafe);
+    if (unsafe.empty()) {
+      break;
+    }
+    for (XThread* thread : unsafe) {
+      thread->thread()->Resume();
+    }
+    xe::threading::Sleep(std::chrono::milliseconds(1));
+    for (XThread* thread : unsafe) {
+      thread->thread()->Suspend();
+    }
+  }
+  if (!unsafe.empty()) {
+    for (XThread* thread : unsafe) {
+      XELOGE("TerminateTitleSafely: thread {:08X} '{}' never reached a safe "
+             "point",
+             thread->thread_id(), thread->name());
+    }
+    for (XThread* thread : threads) {
+      thread->thread()->Resume();
+    }
+    return false;
+  }
+
+  for (XThread* thread : threads) {
+    XELOGI("TerminateTitleSafely: terminating thread {:08X} '{}'",
+           thread->thread_id(), thread->name());
+    thread->Terminate(0);
+    threads_by_id_.erase(thread->thread_id());
+  }
+
+  // The rest as in TerminateTitle.
+  for (size_t i = 0; i < user_modules_.size(); i++) {
+    X_STATUS status = user_modules_[i]->Unload();
+    assert_true(XSUCCEEDED(status));
+    object_table_.RemoveHandle(user_modules_[i]->handle());
+  }
+  user_modules_.clear();
+  object_table_.PurgeAllObjects();
+  notify_listeners_.clear();
+  tls_bitmap_.Reset();
+  executable_module_ = nullptr;
+  if (process_info_block_address_) {
+    memory_->SystemHeapFree(process_info_block_address_);
+    process_info_block_address_ = 0;
+  }
+  app_manager_->OnTitleTerminated();
+  XELOGI("TerminateTitleSafely: done");
+  return true;
+#else
+  return false;
+#endif  // XE_PLATFORM_WIN32
 }
 
 void KernelState::TerminateTitle() {

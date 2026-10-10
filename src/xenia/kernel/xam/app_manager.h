@@ -35,6 +35,11 @@ class App {
   virtual X_HRESULT DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                         uint32_t buffer_length) = 0;
 
+  // The title has been stopped in-process (KernelState::
+  // TerminateTitleSafely) - drop anything tied to it. Its code is gone, so
+  // don't notify or call back into it.
+  virtual void OnTitleTerminated() {}
+
   virtual ~App() = default;
 
  protected:
@@ -55,6 +60,8 @@ class AppManager {
                                 uint32_t buffer_ptr, uint32_t buffer_length);
   X_HRESULT DispatchMessageAsync(uint32_t app_id, uint32_t message,
                                  uint32_t buffer_ptr, uint32_t buffer_length);
+
+  void OnTitleTerminated();
 
  private:
   std::vector<std::unique_ptr<App>> apps_;

@@ -10,6 +10,7 @@
 #ifndef XENIA_HID_INPUT_SYSTEM_H_
 #define XENIA_HID_INPUT_SYSTEM_H_
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -44,8 +45,19 @@ class InputSystem {
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
                         X_INPUT_KEYSTROKE* out_keystroke);
 
+  // While set, the guest sees idle controllers and no keystrokes (see
+  // xam_input.cc), like a real console while the Xbox Guide is open. Host UI
+  // still reads the real state through GetState/GetKeystroke.
+  void set_guest_input_blocked(bool blocked) {
+    guest_input_blocked_.store(blocked, std::memory_order_relaxed);
+  }
+  bool guest_input_blocked() const {
+    return guest_input_blocked_.load(std::memory_order_relaxed);
+  }
+
  private:
   xe::ui::Window* window_ = nullptr;
+  std::atomic<bool> guest_input_blocked_{false};
 
   std::vector<std::unique_ptr<InputDriver>> drivers_;
 };

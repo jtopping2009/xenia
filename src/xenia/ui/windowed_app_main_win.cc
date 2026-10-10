@@ -8,6 +8,7 @@
  */
 
 #include <cstdlib>
+#include <iterator>
 #include <memory>
 
 #include "xenia/base/console.h"
@@ -23,6 +24,27 @@ DEFINE_bool(enable_console, false, "Open a console window with the main window",
 int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev,
                     LPWSTR command_line, int show_cmd) {
   int result;
+
+  // Set by a previous Xenia instance relaunching itself (see
+  // EmulatorWindow::RelaunchXenia) - wait for it to fully exit before touching
+  // anything it may still hold (xenia.log, config, shader storage, audio and
+  // controller devices), since all of those are opened well before
+  // OnInitialize. Bounded so a stuck old process can't block startup forever.
+  {
+    wchar_t wait_pid_str[32];
+    DWORD wait_pid_len = GetEnvironmentVariableW(
+        L"XENIA_RELAUNCH_WAIT_PID", wait_pid_str, DWORD(std::size(wait_pid_str)));
+    if (wait_pid_len && wait_pid_len < std::size(wait_pid_str)) {
+      SetEnvironmentVariableW(L"XENIA_RELAUNCH_WAIT_PID", nullptr);
+      DWORD wait_pid = DWORD(wcstoul(wait_pid_str, nullptr, 10));
+      HANDLE old_process = wait_pid ? OpenProcess(SYNCHRONIZE, FALSE, wait_pid)
+                                    : nullptr;
+      if (old_process) {
+        WaitForSingleObject(old_process, 15000);
+        CloseHandle(old_process);
+      }
+    }
+  }
 
   {
     xe::ui::Win32WindowedAppContext app_context(hinstance, show_cmd);

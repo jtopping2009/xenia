@@ -42,6 +42,10 @@ class AudioSystem {
   X_STATUS RegisterClient(uint32_t callback, uint32_t callback_arg,
                           size_t* out_index);
   void UnregisterClient(size_t index);
+  // Unregisters every client with a guest callback - the running title's
+  // voices - leaving host-side ones (Sendspin music, the XMP soundtrack
+  // player) alone. For when the title is stopped in-process.
+  void UnregisterGuestClients();
   void SubmitFrame(size_t index, uint32_t samples_ptr);
 
   bool Save(ByteStream* stream);

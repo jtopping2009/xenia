@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "xenia/apu/title_music_player.h"
 #include "xenia/base/mutex.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/xam/app_manager.h"
@@ -68,6 +69,11 @@ class XmpApp : public App {
     std::u16string name;
     uint32_t flags;
     std::vector<std::unique_ptr<Song>> songs;
+    // Guest address the real handle was written into at creation time (aka
+    // the value the title treats as its "playlist handle"). Diagnostic-only:
+    // used to watch for out-of-band overwrites of this storage after the
+    // fact - see XMPGetStatus.
+    uint32_t storage_ptr = 0;
   };
 
   explicit XmpApp(KernelState* kernel_state);
@@ -91,6 +97,9 @@ class XmpApp : public App {
   X_HRESULT DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                 uint32_t buffer_length) override;
 
+  // Stops the title's soundtrack and forgets its playlists.
+  void OnTitleTerminated() override;
+
  private:
   static const uint32_t kMsgStateChanged = 0x0A000001;
   static const uint32_t kMsgPlaybackBehaviorChanged = 0x0A000002;
@@ -111,6 +120,13 @@ class XmpApp : public App {
   std::unordered_map<uint32_t, Playlist*> playlists_;
   uint32_t next_playlist_handle_;
   uint32_t next_song_handle_;
+
+  // Diagnostic-only: last value observed at each playlist's storage_ptr, so
+  // XMPGetStatus can detect and log the exact moment something outside our
+  // control overwrites it.
+  std::unordered_map<uint32_t, uint32_t> last_seen_storage_values_;
+
+  apu::TitleMusicPlayer music_player_;
 };
 
 }  // namespace apps

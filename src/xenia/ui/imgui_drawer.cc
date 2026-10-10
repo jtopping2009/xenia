@@ -130,6 +130,21 @@ void ImGuiDrawer::Initialize() {
   } else {
     XELOGW("Unable to load Japanese font; JP characters will be boxes");
   }
+  // A large, smooth font for full-screen menus (the dashboard) - ProggyTiny
+  // scaled up that far is too blocky. Not the default font, so every other
+  // ImGui dialog is unaffected; see ui_font().
+  const char* ui_font_path = "C:\\Windows\\Fonts\\segoeui.ttf";
+  if (std::filesystem::exists(ui_font_path)) {
+    ImFontConfig ui_font_config;
+    ui_font_config.OversampleH = ui_font_config.OversampleV = 2;
+    // Beyond Latin-1, the punctuation official game titles use (dashes, curly
+    // quotes, ellipsis, trademark sign).
+    static const ImWchar ui_font_glyph_ranges[] = {
+        0x0020, 0x00FF, 0x2010, 0x2027, 0x2122, 0x2122, 0,
+    };
+    ui_font_ = io.Fonts->AddFontFromFileTTF(
+        ui_font_path, 48.0f, &ui_font_config, ui_font_glyph_ranges);
+  }
 
   auto& style = ImGui::GetStyle();
   style.ScrollbarRounding = 0;
@@ -232,6 +247,26 @@ void ImGuiDrawer::SetupFontTexture() {
   io.Fonts->TexID = reinterpret_cast<ImTextureID>(font_texture_.get());
 }
 
+void* ImGuiDrawer::GetUserTexture(const std::string& key) const {
+  auto it = user_textures_.find(key);
+  return it != user_textures_.end() ? it->second.get() : nullptr;
+}
+
+void* ImGuiDrawer::CreateUserTexture(const std::string& key, uint32_t width,
+                                     uint32_t height, const uint8_t* rgba) {
+  if (!immediate_drawer_ || !width || !height) {
+    return nullptr;
+  }
+  std::unique_ptr<ImmediateTexture> texture = immediate_drawer_->CreateTexture(
+      width, height, ImmediateTextureFilter::kLinear, false, rgba);
+  if (!texture) {
+    return nullptr;
+  }
+  void* id = texture.get();
+  user_textures_[key] = std::move(texture);
+  return id;
+}
+
 void ImGuiDrawer::SetPresenter(Presenter* new_presenter) {
   if (presenter_) {
     if (presenter_ == new_presenter) {
@@ -257,6 +292,9 @@ void ImGuiDrawer::SetImmediateDrawer(ImmediateDrawer* new_immediate_drawer) {
   if (immediate_drawer_) {
     GetIO().Fonts->TexID = static_cast<ImTextureID>(nullptr);
     font_texture_.reset();
+    // Owners recreate these from their own pixels on the next GetUserTexture
+    // miss.
+    user_textures_.clear();
   }
   immediate_drawer_ = new_immediate_drawer;
   if (immediate_drawer_) {

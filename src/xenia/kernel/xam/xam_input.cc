@@ -7,6 +7,8 @@
  ******************************************************************************
  */
 
+#include <cstring>
+
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
 #include "xenia/hid/input.h"
@@ -102,7 +104,14 @@ dword_result_t XamInputGetState_entry(dword_t user_index, dword_t flags,
   }
 
   auto input_system = kernel_state()->emulator()->input_system();
-  return input_system->GetState(user_index, input_state);
+  X_RESULT result = input_system->GetState(user_index, input_state);
+  if (result == X_ERROR_SUCCESS && input_state &&
+      input_system->guest_input_blocked()) {
+    // Still connected (so the title doesn't show a "reconnect controller"
+    // prompt), just idle.
+    std::memset(&input_state->gamepad, 0, sizeof(input_state->gamepad));
+  }
+  return result;
 }
 DECLARE_XAM_EXPORT2(XamInputGetState, kInput, kImplemented, kHighFrequency);
 
@@ -147,6 +156,9 @@ dword_result_t XamInputGetKeystroke_entry(
   }
 
   auto input_system = kernel_state()->emulator()->input_system();
+  if (input_system->guest_input_blocked()) {
+    return X_ERROR_EMPTY;
+  }
   return input_system->GetKeystroke(user_index, flags, keystroke);
 }
 DECLARE_XAM_EXPORT1(XamInputGetKeystroke, kInput, kImplemented);
@@ -171,6 +183,9 @@ dword_result_t XamInputGetKeystrokeEx_entry(
   }
 
   auto input_system = kernel_state()->emulator()->input_system();
+  if (input_system->guest_input_blocked()) {
+    return X_ERROR_EMPTY;
+  }
   auto result = input_system->GetKeystroke(user_index, flags, keystroke);
   if (XSUCCEEDED(result)) {
     *user_index_ptr = keystroke->user_index;

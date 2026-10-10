@@ -326,6 +326,13 @@ class Presenter {
   const GuestOutputPaintConfig& GetGuestOutputPaintConfigFromUIThread() const {
     return guest_output_paint_config_;
   }
+  // Approximate number of guest frames refreshed via RefreshGuestOutput per
+  // second, averaged over roughly the last second. May be called from any
+  // thread, including while RefreshGuestOutput is being called concurrently
+  // from the command processor thread.
+  float GetGuestOutputFramesPerSecond() const {
+    return guest_output_fps_.load(std::memory_order_relaxed);
+  }
   // For simplicity, may be called repeatedly even if no changes have been made.
   void SetGuestOutputPaintConfigFromUIThread(
       const GuestOutputPaintConfig& new_config);
@@ -960,6 +967,13 @@ class Presenter {
   // Accessible only by refreshing, whether the last refresh contained an image
   // rather than being blank.
   bool guest_output_active_last_refresh_ = false;
+
+  // FPS counting state, accessible only by RefreshGuestOutput (always called
+  // from the same command processor thread for a given Presenter).
+  uint32_t guest_output_fps_frame_count_ = 0;
+  uint64_t guest_output_fps_window_start_ms_ = 0;
+  // The last computed FPS value, read from the UI thread for display.
+  std::atomic<float> guest_output_fps_{0.0f};
 
   // Ordered by the Z order, and then by the time of addition.
   // Note: All the iteration logic involving this Z ordering must be the same as

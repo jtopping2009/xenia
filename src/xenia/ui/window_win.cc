@@ -14,6 +14,7 @@
 #include <string>
 
 #include "xenia/base/assert.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/ui/surface_win.h"
@@ -25,6 +26,12 @@
 
 #include <ShellScalingApi.h>
 #include <dwmapi.h>
+
+DEFINE_uint64(embed_parent_window, 0,
+              "HWND of a frontend shell's window to live inside of, as a "
+              "borderless child filling it - set by the shell when it starts "
+              "Xenia. 0 for a normal top-level window.",
+              "UI");
 
 namespace xe {
 namespace ui {
@@ -116,6 +123,46 @@ bool Win32Window::OpenImpl() {
   dpi_ = GetCurrentSystemDpi();
   DWORD window_style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
   DWORD window_ex_style = WS_EX_APPWINDOW | WS_EX_CONTROLPARENT;
+  // Inside a shell: a plain child filling the shell's client area - the
+  // shell resizes it from then on, and owns fullscreen.
+  HWND embed_parent = HWND(uintptr_t(cvars::embed_parent_window));
+  if (embed_parent && !IsWindow(embed_parent)) {
+    XELOGW("embed_parent_window {:X} is not a window - ignoring",
+           cvars::embed_parent_window);
+    embed_parent = nullptr;
+  }
+  if (embed_parent) {
+    RECT parent_rect;
+    GetClientRect(embed_parent, &parent_rect);
+    hwnd_ = CreateWindowExW(
+        WS_EX_CONTROLPARENT, L"XeniaWindowClass",
+        reinterpret_cast<LPCWSTR>(xe::to_utf16(GetTitle()).c_str()),
+        WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, 0, 0,
+        parent_rect.right - parent_rect.left,
+        parent_rect.bottom - parent_rect.top, embed_parent, nullptr,
+        hinstance, this);
+    if (!hwnd_) {
+      XELOGE("CreateWindowExW (embedded) failed");
+      return false;
+    }
+    dpi_ = GetCurrentSystemDpi();
+    ShowWindow(hwnd_, SW_SHOW);
+    SetFocus(hwnd_);
+    // Report the initial size and focus, as the normal path below does.
+    WindowDestructionReceiver destruction_receiver(this);
+    RECT client_rect;
+    if (GetClientRect(hwnd_, &client_rect)) {
+      OnDesiredLogicalSizeUpdate(SizeToLogical(uint32_t(client_rect.right)),
+                                 SizeToLogical(uint32_t(client_rect.bottom)));
+      OnActualSizeUpdate(uint32_t(client_rect.right),
+                         uint32_t(client_rect.bottom), destruction_receiver);
+      if (destruction_receiver.IsWindowDestroyedOrClosed()) {
+        return true;
+      }
+    }
+    OnFocusUpdate(GetFocus() == hwnd_, destruction_receiver);
+    return true;
+  }
   RECT window_size_rect;
   window_size_rect.left = 0;
   window_size_rect.top = 0;

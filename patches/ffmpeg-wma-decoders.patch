@@ -1,0 +1,41 @@
+diff --git a/config_windows_x86_64.h b/config_windows_x86_64.h
+index 4cec2e2f0b..b4f2ed8ae1 100644
+--- a/config_windows_x86_64.h
++++ b/config_windows_x86_64.h
+@@ -1111,8 +1111,8 @@
+ #define CONFIG_WAVPACK_DECODER 0
+ #define CONFIG_WMALOSSLESS_DECODER 0
+ #define CONFIG_WMAPRO_DECODER 1
+-#define CONFIG_WMAV1_DECODER 0
+-#define CONFIG_WMAV2_DECODER 0
++#define CONFIG_WMAV1_DECODER 1
++#define CONFIG_WMAV2_DECODER 1
+ #define CONFIG_WMAVOICE_DECODER 0
+ #define CONFIG_WS_SND1_DECODER 0
+ #define CONFIG_XMA1_DECODER 0
+diff --git a/libavcodec/codec_list.c b/libavcodec/codec_list.c
+index 8d350e1246..7b37acaacd 100644
+--- a/libavcodec/codec_list.c
++++ b/libavcodec/codec_list.c
+@@ -1,4 +1,6 @@
+ static const AVCodec * const codec_list[] = {
+     &ff_wmapro_decoder,
+     &ff_xmaframes_decoder,
++    &ff_wmav1_decoder,
++    &ff_wmav2_decoder,
+     NULL };
+diff --git a/libavcodec/premake5.lua b/libavcodec/premake5.lua
+index 4c8ee05b00..59786cf7e2 100644
+--- a/libavcodec/premake5.lua
++++ b/libavcodec/premake5.lua
+@@ -92,8 +92,10 @@ project("libavcodec")
+     "sinewin.c",
+     "wma_freqs.c",
+     "wmaprodec.c",
++    "wmadec.c",
+     "wma.c",
+     "wma_common.c",
++    "aactab.c",
+     "null_bsf.c",
+     "pthread.c",
+     "pthread_slice.c",

@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "xenia/base/assert.h"
+#include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
@@ -374,6 +375,22 @@ bool Presenter::RefreshGuestOutput(
       return false;
     }
     guest_output_active_last_refresh_ = true;
+
+    // Update the rolling FPS counter, resetting it once per ~1 second window.
+    uint64_t now_ms = Clock::QueryHostUptimeMillis();
+    if (guest_output_fps_window_start_ms_ == 0) {
+      guest_output_fps_window_start_ms_ = now_ms;
+    }
+    ++guest_output_fps_frame_count_;
+    uint64_t window_elapsed_ms = now_ms - guest_output_fps_window_start_ms_;
+    if (window_elapsed_ms >= 1000) {
+      guest_output_fps_.store(
+          float(double(guest_output_fps_frame_count_) * 1000.0 /
+                double(window_elapsed_ms)),
+          std::memory_order_relaxed);
+      guest_output_fps_frame_count_ = 0;
+      guest_output_fps_window_start_ms_ = now_ms;
+    }
   } else {
     // Request presenting a blank image if there was a true image previously,
     // but not now.

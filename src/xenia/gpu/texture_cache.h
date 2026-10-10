@@ -18,12 +18,16 @@
 #include <unordered_map>
 
 #include "xenia/base/assert.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/hash.h"
 #include "xenia/base/mutex.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/shared_memory.h"
 #include "xenia/gpu/texture_util.h"
 #include "xenia/gpu/xenos.h"
+
+DECLARE_int32(draw_resolution_scale_x);
+DECLARE_int32(draw_resolution_scale_y);
 
 namespace xe {
 namespace gpu {

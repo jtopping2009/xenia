@@ -156,6 +156,14 @@ class KernelState {
   // Terminates a title: Unloads all modules, and kills all guest threads.
   // This DOES NOT RETURN if called from a guest thread!
   void TerminateTitle();
+  // Like TerminateTitle, but only kills each guest thread at a point where
+  // it can't be holding host locks - running JIT code, or blocked in an OS
+  // wait - rather than stepping it with breakpoints, which never returns for
+  // a thread blocked in a kernel wait and hung real games. For stopping a
+  // title while Xenia keeps running (leaving to the dashboard). Returns false
+  // if some thread never reached a safe point; the process is then only fit
+  // to be restarted. Call from a host thread, not a guest one.
+  bool TerminateTitleSafely();
 
   void RegisterThread(XThread* thread);
   void UnregisterThread(XThread* thread);

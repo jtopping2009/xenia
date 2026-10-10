@@ -31,6 +31,12 @@ void AppManager::RegisterApps(KernelState* kernel_state, AppManager* manager) {
   manager->RegisterApp(std::make_unique<apps::XamApp>(kernel_state));
 }
 
+void AppManager::OnTitleTerminated() {
+  for (auto& app : apps_) {
+    app->OnTitleTerminated();
+  }
+}
+
 void AppManager::RegisterApp(std::unique_ptr<App> app) {
   assert_zero(app_lookup_.count(app->app_id()));
   app_lookup_.insert({app->app_id(), app.get()});

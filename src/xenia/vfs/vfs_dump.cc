@@ -17,6 +17,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 
+#include "xenia/vfs/devices/disc_image_device.h"
 #include "xenia/vfs/devices/stfs_container_device.h"
 #include "xenia/vfs/file.h"
 
@@ -43,8 +44,12 @@ int vfs_dump_main(const std::vector<std::string>& args) {
   // TODO: Flags specifying the type of device.
   device = std::make_unique<vfs::StfsContainerDevice>("", cvars::source);
   if (!device->Initialize()) {
-    XELOGE("Failed to initialize device");
-    return 1;
+    XELOGI("Not an STFS container, trying as a disc image...");
+    device = std::make_unique<vfs::DiscImageDevice>("", cvars::source);
+    if (!device->Initialize()) {
+      XELOGE("Failed to initialize device");
+      return 1;
+    }
   }
 
   // Run through all the files, breadth-first style.

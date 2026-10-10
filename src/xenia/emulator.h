@@ -10,6 +10,7 @@
 #ifndef XENIA_EMULATOR_H_
 #define XENIA_EMULATOR_H_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -172,6 +173,16 @@ class Emulator {
   // Terminates the currently running title.
   X_STATUS TerminateTitle();
 
+  // Stops the running title and releases what's tied to it (threads,
+  // modules, its audio voices and GPU interrupt callback, its disc), leaving
+  // Xenia running with no title - see KernelState::TerminateTitleSafely.
+  // Loading another title into the same process afterwards isn't supported
+  // (its translated code and memory aren't reset), so restart for that - see
+  // title_unloaded_in_place(). Returns false if it couldn't be done safely.
+  // Call from a host thread other than the UI one; it can take a moment.
+  bool UnloadTitleInPlace();
+  bool title_unloaded_in_place() const { return title_unloaded_in_place_; }
+
   // Launches a game from the given file path.
   // This will attempt to infer the type of the given file (such as an iso, etc)
   // using heuristics.
@@ -251,7 +262,8 @@ class Emulator {
   size_t game_config_load_callback_loop_next_index_ = SIZE_MAX;
 
   kernel::object_ref<kernel::XThread> main_thread_;
-  std::optional<uint32_t> title_id_;  // Currently running title ID
+  std::optional<uint32_t> title_id_;
+  std::atomic<bool> title_unloaded_in_place_{false};  // Currently running title ID
 
   bool paused_;
   bool restoring_;

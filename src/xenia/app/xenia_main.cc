@@ -487,6 +487,11 @@ bool EmulatorApp::OnInitialize() {
 }
 
 void EmulatorApp::OnDestroy() {
+  // Closing the window is a real exit - Xenia's music stops with it.
+  if (emulator_window_) {
+    emulator_window_->StopMusicForExit();
+  }
+
   ShutdownEmulatorThreadFromUIThread();
 
   if (cvars::discord) {

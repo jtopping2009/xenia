@@ -274,6 +274,29 @@ X_STATUS Emulator::TerminateTitle() {
   return X_STATUS_SUCCESS;
 }
 
+bool Emulator::UnloadTitleInPlace() {
+  if (!is_title_open()) {
+    return false;
+  }
+  // Set first: whatever happens from here, this process mustn't load another
+  // title.
+  title_unloaded_in_place_ = true;
+  if (!kernel_state_->TerminateTitleSafely()) {
+    return false;
+  }
+  graphics_system_->SetInterruptCallback(0, 0);
+  audio_system_->UnregisterGuestClients();
+  file_system_->UnregisterSymbolicLink("game:");
+  file_system_->UnregisterSymbolicLink("d:");
+  file_system_->UnregisterDevice("\\Device\\Cdrom0");
+  file_system_->UnregisterDevice("\\Device\\Harddisk0\\Partition1");
+  title_id_ = std::nullopt;
+  title_name_ = "";
+  title_version_ = "";
+  on_terminate();
+  return true;
+}
+
 X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
   // Launch based on file type.
   // This is a silly guess based on file extension.
