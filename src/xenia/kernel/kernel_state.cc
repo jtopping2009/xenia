@@ -917,6 +917,16 @@ void KernelState::CompleteOverlappedDeferredEx(
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
   XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
+  // Unsignaled until this completes, as on the console - a title reusing the
+  // event of an earlier operation it never waited on (WWE SmackDown vs. Raw
+  // 2007's saves) would otherwise see this one done before it's started.
+  X_HANDLE event_handle = XOverlappedGetEvent(ptr);
+  if (event_handle) {
+    auto ev = object_table()->LookupObject<XObject>(event_handle);
+    if (ev && ev->type() == XObject::Type::Event) {
+      static_cast<XEvent*>(ev.get())->Reset();
+    }
+  }
   auto global_lock = global_critical_region_.Acquire();
   dispatch_queue_.push_back([this, completion_callback, overlapped_ptr,
                              pre_callback, post_callback]() {

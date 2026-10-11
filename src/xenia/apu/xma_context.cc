@@ -615,8 +615,22 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
       // assert_true(frame_is_split == (frame_idx == -1));
 
       //			dump_raw(av_frame_, id());
-      ConvertFrame((const uint8_t**)av_frame_->data, bool(data->is_stereo),
-                   raw_frame_.data());
+      // From bad data FFmpeg can return a frame without every channel (or
+      // short) - silence rather than reading past it (Spider-Man 3 crashed
+      // here a minute or so into the game).
+      if (av_frame_->data[0] &&
+          (!data->is_stereo || av_frame_->data[1]) &&
+          av_frame_->nb_samples >= int(kSamplesPerFrame)) {
+        ConvertFrame((const uint8_t**)av_frame_->data, bool(data->is_stereo),
+                     raw_frame_.data());
+      } else {
+        XELOGW(
+            "XmaContext {}: decoded frame has {} samples, channel data {} {} "
+            "- outputting silence",
+            id(), av_frame_->nb_samples, av_frame_->data[0] ? "yes" : "no",
+            av_frame_->data[1] ? "yes" : "no");
+        std::memset(raw_frame_.data(), 0, raw_frame_.size());
+      }
       // decoded_consumed_samples_ += kSamplesPerFrame;
 
       auto byte_count = kBytesPerFrameChannel << data->is_stereo;

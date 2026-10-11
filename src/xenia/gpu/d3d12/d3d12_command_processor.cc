@@ -46,6 +46,11 @@ DEFINE_bool(d3d12_readback_resolve, false,
             "causes mid-frame synchronization, so it has a huge performance "
             "impact.",
             "D3D12");
+DEFINE_int32(d3d12_readback_resolve_max_bytes, 0,
+             "With d3d12_readback_resolve, only read back resolves of at most "
+             "this many bytes (0 for any size) - small ones like a game's HDR "
+             "exposure measurement, skipping the costly full-screen ones.",
+             "D3D12");
 DEFINE_bool(d3d12_submit_on_primary_buffer_end, true,
             "Submit the command list when a PM4 primary buffer ends if it's "
             "possible to submit immediately to try to reduce frame latency.",
@@ -2505,7 +2510,10 @@ bool D3D12CommandProcessor::IssueCopy() {
     return false;
   }
   if (cvars::d3d12_readback_resolve &&
-      !texture_cache_->IsDrawResolutionScaled() && written_length) {
+      !texture_cache_->IsDrawResolutionScaled() && written_length &&
+      (cvars::d3d12_readback_resolve_max_bytes <= 0 ||
+       written_length <=
+           uint32_t(cvars::d3d12_readback_resolve_max_bytes))) {
     // Read the resolved data on the CPU.
     ID3D12Resource* readback_buffer = RequestReadbackBuffer(written_length);
     if (readback_buffer != nullptr) {
