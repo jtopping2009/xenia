@@ -246,4 +246,37 @@ void LoadGameConfig(const std::string_view title_id) {
   }
 }
 
+namespace {
+template <typename T>
+std::optional<T> GetGameConfigValue(const std::string_view title_id,
+                                    const std::string_view key) {
+  const auto game_config_path = config_folder / "config" /
+                                (std::string(title_id) + game_config_suffix);
+  if (!std::filesystem::exists(game_config_path)) {
+    return std::nullopt;
+  }
+  try {
+    auto value =
+        ParseFile(game_config_path)->get_qualified_as<T>(std::string(key));
+    if (value) {
+      return *value;
+    }
+  } catch (const std::exception& e) {
+    XELOGW("Couldn't read {}: {}", xe::path_to_utf8(game_config_path),
+           e.what());
+  }
+  return std::nullopt;
+}
+}  // namespace
+
+std::optional<int64_t> GetGameConfigInteger(const std::string_view title_id,
+                                            const std::string_view key) {
+  return GetGameConfigValue<int64_t>(title_id, key);
+}
+
+std::optional<std::string> GetGameConfigString(const std::string_view title_id,
+                                               const std::string_view key) {
+  return GetGameConfigValue<std::string>(title_id, key);
+}
+
 }  // namespace config

@@ -68,6 +68,7 @@ DECLARE_bool(debug);
 DECLARE_path(target);
 DECLARE_uint64(embed_parent_window);
 DECLARE_bool(vsync);
+DECLARE_string(gpu);
 
 DEFINE_bool(fullscreen, false, "Whether to launch the emulator in fullscreen.",
             "Display");
@@ -1697,7 +1698,28 @@ void EmulatorWindow::GuideMenuOverlay::ConfirmGamesBrowserSelection() {
     return;
   }
 
-  if (emulator_window_.emulator()->title_unloaded_in_place()) {
+  // The graphics backend and resolution scale are fixed when the GPU is set
+  // up - a game whose own config sets different ones needs a fresh process,
+  // which loads that config before setting up (see
+  // EmulatorApp::EmulatorThread).
+  bool needs_other_setup = false;
+  if (const GameMetadata* metadata = FindGameMetadata(path)) {
+    if (metadata->title_id) {
+      std::string title_id = fmt::format("{:08X}", metadata->title_id);
+      auto scale_x = config::GetGameConfigInteger(
+          title_id, "GPU.draw_resolution_scale_x");
+      auto scale_y = config::GetGameConfigInteger(
+          title_id, "GPU.draw_resolution_scale_y");
+      auto gpu = config::GetGameConfigString(title_id, "GPU.gpu");
+      needs_other_setup =
+          (scale_x && *scale_x != cvars::draw_resolution_scale_x) ||
+          (scale_y && *scale_y != cvars::draw_resolution_scale_y) ||
+          (gpu && *gpu != cvars::gpu);
+    }
+  }
+
+  if (emulator_window_.emulator()->title_unloaded_in_place() ||
+      needs_other_setup) {
     // A game already ran in this process and was left in place - its code
     // and memory are still around, so the next one needs a fresh process.
     last_action_message_ = "Loading: " + display_name;

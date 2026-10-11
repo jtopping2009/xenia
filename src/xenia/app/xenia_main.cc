@@ -516,6 +516,18 @@ void EmulatorApp::EmulatorThread() {
   xe::threading::set_name("Emulator");
   Profiler::ThreadEnter("Emulator");
 
+  // Started on a game: load its own config now, not only at launch, so what's
+  // fixed at setup (the resolution scale) can be per game too.
+  if (!cvars::target.empty()) {
+    GameMetadata metadata;
+    if (LoadGameMetadataCached(std::filesystem::absolute(cvars::target),
+                               emulator_->cache_root() / "dashboard",
+                               &metadata) &&
+        metadata.title_id) {
+      config::LoadGameConfig(fmt::format("{:08X}", metadata.title_id));
+    }
+  }
+
   // Setup and initialize all subsystems. If we can't do something
   // (unsupported system, memory issues, etc) this will fail early.
   X_STATUS result = emulator_->Setup(
