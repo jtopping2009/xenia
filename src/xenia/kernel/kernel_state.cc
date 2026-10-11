@@ -9,6 +9,7 @@
 
 #include "xenia/kernel/kernel_state.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <string>
@@ -499,8 +500,11 @@ void KernelState::UnloadUserModule(const object_ref<UserModule>& module,
 namespace {
 // Whether a suspended thread is somewhere it's safe to kill: executing
 // translated guest code (which takes no host locks itself), or parked in an
-// ntdll wait syscall (which covers blocking on the global lock we hold, on
-// kernel objects, and sleeps).
+// ntdll wait on kernel objects or a sleep. Not blocked on a lock or condition
+// variable (SRW locks, critical sections, std::mutex - NtWaitForAlertByThreadId
+// and NtWaitForKeyedEvent): those keep their wait block on the waiter's stack,
+// linked into the lock, so killing the waiter leaves the lock pointing into
+// freed memory, and its next release crashes.
 bool IsThreadAtKillSafePoint(HANDLE thread, uintptr_t code_begin,
                              uintptr_t code_end) {
   CONTEXT context = {};
@@ -512,16 +516,15 @@ bool IsThreadAtKillSafePoint(HANDLE thread, uintptr_t code_begin,
   if (pc >= code_begin && pc < code_end) {
     return true;
   }
-  static const std::array<uintptr_t, 7> wait_stubs = [] {
+  static const std::array<uintptr_t, 5> wait_stubs = [] {
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     auto stub = [ntdll](const char* name) {
       return ntdll ? uintptr_t(GetProcAddress(ntdll, name)) : uintptr_t(0);
     };
-    return std::array<uintptr_t, 7>{
-        stub("NtWaitForSingleObject"),   stub("NtWaitForMultipleObjects"),
-        stub("NtDelayExecution"),        stub("NtWaitForAlertByThreadId"),
-        stub("NtRemoveIoCompletion"),    stub("NtSignalAndWaitForSingleObject"),
-        stub("NtWaitForKeyedEvent")};
+    return std::array<uintptr_t, 5>{
+        stub("NtWaitForSingleObject"), stub("NtWaitForMultipleObjects"),
+        stub("NtDelayExecution"), stub("NtRemoveIoCompletion"),
+        stub("NtSignalAndWaitForSingleObject")};
   }();
   // A thread blocked in a syscall sits just past the `syscall` instruction
   // inside its ~0x20-byte stub.
@@ -538,20 +541,27 @@ bool IsThreadAtKillSafePoint(HANDLE thread, uintptr_t code_begin,
 bool KernelState::TerminateTitleSafely() {
 #if XE_PLATFORM_WIN32
   XELOGI("KernelState::TerminateTitleSafely");
-  // While this is held no other thread is inside kernel code that takes it,
-  // and any thread that tries to ends up in a wait - a safe point.
-  auto global_lock = global_critical_region_.Acquire();
-
+  // The title's threads, suspended. Not under the global lock while they're
+  // brought to safe points: threads waiting for it couldn't get past it.
   std::vector<XThread*> threads;
-  for (auto& it : threads_by_id_) {
-    XThread* thread = it.second;
-    if (!XThread::IsInThread(thread) && thread->is_guest_thread() &&
-        thread->is_running()) {
-      threads.push_back(thread);
+  auto suspend_new_threads = [this, &threads]() {
+    size_t added = 0;
+    for (auto& it : threads_by_id_) {
+      XThread* thread = it.second;
+      if (!XThread::IsInThread(thread) && thread->is_guest_thread() &&
+          thread->is_running() &&
+          std::find(threads.begin(), threads.end(), thread) ==
+              threads.end()) {
+        thread->thread()->Suspend();
+        threads.push_back(thread);
+        ++added;
+      }
     }
-  }
-  for (XThread* thread : threads) {
-    thread->thread()->Suspend();
+    return added;
+  };
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    suspend_new_threads();
   }
 
   auto code_cache = processor()->backend()->code_cache();
@@ -578,6 +588,18 @@ bool KernelState::TerminateTitleSafely() {
     xe::threading::Sleep(std::chrono::milliseconds(1));
     for (XThread* thread : unsafe) {
       thread->thread()->Suspend();
+    }
+  }
+  // Threads started meanwhile (by ones let run on above) must go too - and
+  // be brought to safe points the same way first.
+  auto global_lock = global_critical_region_.Acquire();
+  if (unsafe.empty() && suspend_new_threads()) {
+    XELOGW("TerminateTitleSafely: the title started threads while stopping");
+    for (XThread* thread : threads) {
+      if (!IsThreadAtKillSafePoint(HANDLE(thread->thread()->native_handle()),
+                                   code_begin, code_end)) {
+        unsafe.push_back(thread);
+      }
     }
   }
   if (!unsafe.empty()) {
