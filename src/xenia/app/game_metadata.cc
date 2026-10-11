@@ -9,6 +9,9 @@
 
 #include "xenia/app/game_metadata.h"
 
+#include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -19,12 +22,21 @@
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/mapped_memory.h"
+#include "xenia/base/platform.h"
+#include "xenia/base/string.h"
 #include "xenia/base/utf8.h"
 #include "xenia/cpu/xex_module.h"
 #include "xenia/kernel/util/xdbf_utils.h"
 #include "xenia/kernel/util/xex2_info.h"
 #include "xenia/vfs/devices/disc_image_device.h"
 #include "xenia/vfs/devices/disc_image_entry.h"
+
+#if XE_PLATFORM_WIN32
+#include "xenia/base/platform_win.h"
+// After windows.h.
+#include <urlmon.h>
+#pragma comment(lib, "urlmon.lib")
+#endif  // XE_PLATFORM_WIN32
 
 #if XE_COMPILER_MSVC
 #pragma warning(push)
@@ -258,6 +270,570 @@ bool LoadGameMetadataCached(const std::filesystem::path& game_path,
     icon.write(reinterpret_cast<const char*>(icon_png.data()),
                std::streamsize(icon_png.size()));
   }
+  return true;
+}
+
+namespace {
+
+constexpr char kLaunchBoxUrl[] =
+    "https://gamesdb.launchbox-app.com/Metadata.zip";
+constexpr char kLaunchBoxImageUrl[] = "https://images.launchbox-app.com/";
+constexpr char kLaunchBoxPlatform[] = "Microsoft Xbox 360";
+// The index's first line - bump when its format or contents change.
+constexpr char kLaunchBoxIndexMagic[] = "xenia-launchbox-xbox360 2";
+constexpr auto kLaunchBoxIndexMaxAge = std::chrono::hours(24 * 30);
+
+// Downloads `url` to `path`. The download can't be interrupted part way, but
+// a stopped caller just doesn't wait on the result.
+bool Download(const std::string& url, const std::filesystem::path& path) {
+#if XE_PLATFORM_WIN32
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+  std::u16string wide_url = xe::to_utf16(url);
+  return SUCCEEDED(URLDownloadToFileW(
+      nullptr, reinterpret_cast<const wchar_t*>(wide_url.c_str()),
+      path.c_str(), 0, nullptr));
+#else
+  return false;
+#endif  // XE_PLATFORM_WIN32
+}
+
+// Takes `member` out of the zip at `zip` into the zip's folder, with the tar
+// Windows ships (which reads zips).
+bool Unzip(const std::filesystem::path& zip, const std::string& member) {
+#if XE_PLATFORM_WIN32
+  wchar_t system[MAX_PATH];
+  if (!GetSystemDirectoryW(system, MAX_PATH)) {
+    return false;
+  }
+  std::wstring command = L"\"" +
+                         (std::filesystem::path(system) / "tar.exe").wstring() +
+                         L"\" -xf \"" + zip.filename().wstring() + L"\" " +
+                         std::wstring(member.begin(), member.end());
+  STARTUPINFOW startup = {sizeof(startup)};
+  PROCESS_INFORMATION process = {};
+  std::wstring folder = zip.parent_path().wstring();
+  if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
+                      CREATE_NO_WINDOW, nullptr, folder.c_str(), &startup,
+                      &process)) {
+    return false;
+  }
+  WaitForSingleObject(process.hProcess, INFINITE);
+  DWORD exit_code = 1;
+  GetExitCodeProcess(process.hProcess, &exit_code);
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  return exit_code == 0;
+#else
+  return false;
+#endif  // XE_PLATFORM_WIN32
+}
+
+// Undoes the XML escapes LaunchBox's values use.
+std::string XmlUnescape(const std::string& text) {
+  if (text.find('&') == std::string::npos) {
+    return text;
+  }
+  std::string out;
+  out.reserve(text.size());
+  for (size_t i = 0; i < text.size(); ++i) {
+    if (text[i] != '&') {
+      out += text[i];
+      continue;
+    }
+    size_t end = text.find(';', i);
+    if (end == std::string::npos || end - i > 10) {
+      out += text[i];
+      continue;
+    }
+    std::string entity = text.substr(i + 1, end - i - 1);
+    uint32_t code = 0;
+    if (entity == "amp") {
+      code = '&';
+    } else if (entity == "lt") {
+      code = '<';
+    } else if (entity == "gt") {
+      code = '>';
+    } else if (entity == "quot") {
+      code = '"';
+    } else if (entity == "apos") {
+      code = '\'';
+    } else if (entity.size() > 1 && entity[0] == '#') {
+      code = entity[1] == 'x' || entity[1] == 'X'
+                 ? uint32_t(std::strtoul(entity.c_str() + 2, nullptr, 16))
+                 : uint32_t(std::strtoul(entity.c_str() + 1, nullptr, 10));
+    }
+    if (!code) {
+      out += text[i];
+      continue;
+    }
+    // As UTF-8.
+    if (code < 0x80) {
+      out += char(code);
+    } else if (code < 0x800) {
+      out += char(0xC0 | (code >> 6));
+      out += char(0x80 | (code & 0x3F));
+    } else {
+      out += char(0xE0 | (code >> 12));
+      out += char(0x80 | ((code >> 6) & 0x3F));
+      out += char(0x80 | (code & 0x3F));
+    }
+    i = end;
+  }
+  return out;
+}
+
+// The words of a title that matter for matching: lower case, without
+// bracketed tags, apostrophes, punctuation, "the" and "and" ("&").
+std::string TitleKey(const std::string& title) {
+  std::string text;
+  int depth = 0;
+  for (char c : title) {
+    if (c == '(' || c == '[') {
+      ++depth;
+    } else if (c == ')' || c == ']') {
+      depth = std::max(0, depth - 1);
+    } else if (!depth && c != '\'') {
+      text += c == '&' ? ' ' : c;
+    }
+  }
+  std::string key, word;
+  auto flush = [&]() {
+    if (!word.empty() && word != "the" && word != "and") {
+      if (!key.empty()) {
+        key += ' ';
+      }
+      key += word;
+    }
+    word.clear();
+  };
+  for (char c : text) {
+    if (std::isalnum(uint8_t(c))) {
+      word += char(std::tolower(uint8_t(c)));
+    } else if (uint8_t(c) < 0x80) {
+      flush();
+    } else {
+      word += c;  // Accented letters, as they are.
+    }
+  }
+  flush();
+  return key;
+}
+
+// Index lines are tab-separated - keep values to one line, without tabs.
+std::string IndexField(const std::string& value) {
+  std::string out;
+  for (char c : value) {
+    if (c == '\\') {
+      out += "\\\\";
+    } else if (c == '\n') {
+      out += "\\n";
+    } else if (c == '\t') {
+      out += ' ';
+    } else if (c != '\r') {
+      out += c;
+    }
+  }
+  return out;
+}
+
+std::string IndexValue(const std::string& field) {
+  std::string out;
+  for (size_t i = 0; i < field.size(); ++i) {
+    if (field[i] == '\\' && i + 1 < field.size()) {
+      out += field[i + 1] == 'n' ? '\n' : field[i + 1];
+      ++i;
+    } else {
+      out += field[i];
+    }
+  }
+  return out;
+}
+
+// How much a picture's region suits a US-English dashboard - lower first.
+int RegionRank(const std::string& region) {
+  if (region == "North America" || region == "United States") {
+    return 0;
+  }
+  if (region.empty() || region == "World") {
+    return 1;
+  }
+  if (region == "Europe" || region == "United Kingdom" ||
+      region == "Australia" || region == "Canada") {
+    return 2;
+  }
+  return 3;
+}
+
+// Reads Metadata.xml a line at a time (each value is on a line of its own, or
+// starts on one and runs over the next ones), writing the Xbox 360 games to
+// the index at `index_path`.
+bool BuildLaunchBoxIndex(const std::filesystem::path& xml_path,
+                         const std::filesystem::path& index_path) {
+  std::ifstream xml(xml_path, std::ios::binary);
+  if (!xml) {
+    return false;
+  }
+  struct Entry {
+    LaunchBoxGame game;
+    std::vector<std::string> alternate_names;
+    int box_rank = 99;
+  };
+  std::unordered_map<std::string, Entry> games;  // By DatabaseID.
+  // Records can come in any order - keep the others' parts for later.
+  std::vector<std::pair<std::string, std::string>> alternate_names;
+  struct Image {
+    std::string id, type, region, file;
+  };
+  std::vector<Image> images;
+
+  std::string record;
+  std::unordered_map<std::string, std::string> fields;
+  std::string open_field, open_value;
+  std::string line;
+  while (std::getline(xml, line)) {
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    if (!open_field.empty()) {
+      // A value running over several lines.
+      std::string close = "</" + open_field + ">";
+      size_t end = line.find(close);
+      open_value += '\n';
+      open_value += end == std::string::npos ? line : line.substr(0, end);
+      if (end != std::string::npos) {
+        fields[open_field] = XmlUnescape(open_value);
+        open_field.clear();
+      }
+      continue;
+    }
+    size_t start = line.find_first_not_of(" \t");
+    if (start == std::string::npos) {
+      continue;
+    }
+    std::string_view text(line.data() + start, line.size() - start);
+    if (text == "<Game>" || text == "<GameAlternateName>" ||
+        text == "<GameImage>") {
+      record = std::string(text.substr(1, text.size() - 2));
+      fields.clear();
+      continue;
+    }
+    if (text == "</Game>") {
+      if (fields["Platform"] == kLaunchBoxPlatform) {
+        Entry& entry = games[fields["DatabaseID"]];
+        LaunchBoxGame& game = entry.game;
+        game.name = fields["Name"];
+        game.release_date = fields["ReleaseDate"].substr(0, 10);
+        game.developer = fields["Developer"];
+        game.publisher = fields["Publisher"];
+        game.genres = fields["Genres"];
+        game.players = fields["MaxPlayers"];
+        game.overview = fields["Overview"];
+      }
+      record.clear();
+      continue;
+    }
+    if (text == "</GameAlternateName>") {
+      alternate_names.emplace_back(fields["DatabaseID"],
+                                   fields["AlternateName"]);
+      record.clear();
+      continue;
+    }
+    if (text == "</GameImage>") {
+      const std::string& type = fields["Type"];
+      if (type == "Box - Front" || type == "Fanart - Background") {
+        images.push_back(
+            {fields["DatabaseID"], type, fields["Region"], fields["FileName"]});
+      }
+      record.clear();
+      continue;
+    }
+    if (record.empty() || text.size() < 3 || text[0] != '<') {
+      continue;
+    }
+    size_t name_end = text.find('>');
+    if (name_end == std::string_view::npos) {
+      continue;
+    }
+    if (text[name_end - 1] == '/') {
+      // An empty value: "<Genres />".
+      continue;
+    }
+    // The name, without any attributes ("<AlternateName
+    // xml:space="preserve">").
+    std::string name(text.substr(1, name_end - 1));
+    name = name.substr(0, name.find(' '));
+    std::string_view rest = text.substr(name_end + 1);
+    std::string close = "</" + name + ">";
+    size_t end = rest.find(close);
+    if (end == std::string_view::npos) {
+      open_field = name;
+      open_value = std::string(rest);
+    } else {
+      fields[name] = XmlUnescape(std::string(rest.substr(0, end)));
+    }
+  }
+  if (games.empty()) {
+    return false;
+  }
+
+  for (const auto& [id, name] : alternate_names) {
+    auto it = games.find(id);
+    if (it != games.end() && !name.empty()) {
+      it->second.alternate_names.push_back(name);
+    }
+  }
+  for (const Image& image : images) {
+    auto it = games.find(image.id);
+    if (it == games.end()) {
+      continue;
+    }
+    Entry& entry = it->second;
+    if (image.type == "Box - Front") {
+      int rank = RegionRank(image.region);
+      if (rank < entry.box_rank) {
+        entry.box_rank = rank;
+        entry.game.box_front = image.file;
+      }
+    } else if (entry.game.fanart.empty()) {
+      entry.game.fanart = image.file;
+    }
+  }
+
+  std::filesystem::path temp_path = index_path;
+  temp_path += ".new";
+  {
+    std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+    out << kLaunchBoxIndexMagic << "\n";
+    for (const auto& [id, entry] : games) {
+      const LaunchBoxGame& game = entry.game;
+      std::string alternates;
+      for (const std::string& name : entry.alternate_names) {
+        if (!alternates.empty()) {
+          alternates += '|';
+        }
+        alternates += IndexField(name);
+      }
+      out << IndexField(game.name) << '\t' << alternates << '\t'
+          << IndexField(game.box_front) << '\t' << IndexField(game.fanart)
+          << '\t' << IndexField(game.release_date) << '\t'
+          << IndexField(game.developer) << '\t' << IndexField(game.publisher)
+          << '\t' << IndexField(game.genres) << '\t'
+          << IndexField(game.players) << '\t' << IndexField(game.overview)
+          << '\n';
+    }
+    if (!out) {
+      return false;
+    }
+  }
+  std::error_code ec;
+  std::filesystem::rename(temp_path, index_path, ec);
+  XELOGI("Dashboard: LaunchBox index built: {} Xbox 360 games", games.size());
+  return !ec;
+}
+
+std::vector<std::string> SplitTabs(const std::string& line) {
+  std::vector<std::string> out;
+  size_t start = 0;
+  while (true) {
+    size_t tab = line.find('\t', start);
+    out.push_back(line.substr(start, tab - start));
+    if (tab == std::string::npos) {
+      return out;
+    }
+    start = tab + 1;
+  }
+}
+
+}  // namespace
+
+bool LaunchBoxIndex::Load(const std::filesystem::path& cache_dir,
+                          const std::atomic<bool>& stop) {
+  games_.clear();
+  by_key_.clear();
+  std::filesystem::path index_path = cache_dir / "launchbox_xbox360.tsv";
+  std::error_code ec;
+  std::filesystem::create_directories(cache_dir, ec);
+
+  bool fresh = false;
+  {
+    std::ifstream index(index_path, std::ios::binary);
+    std::string magic;
+    if (index && std::getline(index, magic) && magic == kLaunchBoxIndexMagic) {
+      auto written = std::filesystem::last_write_time(index_path, ec);
+      fresh = !ec && std::filesystem::file_time_type::clock::now() - written <
+                         kLaunchBoxIndexMaxAge;
+    }
+  }
+  if (!fresh) {
+    XELOGI("Dashboard: downloading the LaunchBox games database");
+    std::filesystem::path zip_path = cache_dir / "launchbox_metadata.zip";
+    std::filesystem::path xml_path = cache_dir / "Metadata.xml";
+    // A download from a failed try is reused (it's ~100 MB) if it's recent.
+    auto zip_time = std::filesystem::last_write_time(zip_path, ec);
+    bool have_zip =
+        !ec && std::filesystem::file_size(zip_path, ec) > 1000000 && !ec &&
+        std::filesystem::file_time_type::clock::now() - zip_time <
+            std::chrono::hours(24);
+    bool built = (have_zip || Download(kLaunchBoxUrl, zip_path)) && !stop &&
+                 Unzip(zip_path, "Metadata.xml") && !stop &&
+                 BuildLaunchBoxIndex(xml_path, index_path);
+    std::filesystem::remove(xml_path, ec);
+    if (built) {
+      std::filesystem::remove(zip_path, ec);
+    } else {
+      XELOGW("Dashboard: couldn't build the LaunchBox index");
+      // An old index is still better than none.
+    }
+  }
+
+  std::ifstream index(index_path, std::ios::binary);
+  std::string line;
+  if (!index || !std::getline(index, line) || line != kLaunchBoxIndexMagic) {
+    return false;
+  }
+  // Main names first, so an alternate name never takes another game's.
+  std::vector<std::vector<std::string>> alternates;
+  while (std::getline(index, line)) {
+    std::vector<std::string> fields = SplitTabs(line);
+    if (fields.size() < 10) {
+      continue;
+    }
+    LaunchBoxGame game;
+    game.name = IndexValue(fields[0]);
+    game.box_front = IndexValue(fields[2]);
+    game.fanart = IndexValue(fields[3]);
+    game.release_date = IndexValue(fields[4]);
+    game.developer = IndexValue(fields[5]);
+    game.publisher = IndexValue(fields[6]);
+    game.genres = IndexValue(fields[7]);
+    game.players = IndexValue(fields[8]);
+    game.overview = IndexValue(fields[9]);
+    std::vector<std::string> names;
+    size_t start = 0;
+    while (!fields[1].empty()) {
+      size_t bar = fields[1].find('|', start);
+      names.push_back(IndexValue(fields[1].substr(start, bar - start)));
+      if (bar == std::string::npos) {
+        break;
+      }
+      start = bar + 1;
+    }
+    alternates.push_back(std::move(names));
+    games_.push_back(std::move(game));
+  }
+  auto add = [this](const std::string& name, size_t index) {
+    std::string key = TitleKey(name);
+    if (key.empty()) {
+      return;
+    }
+    auto [it, inserted] = by_key_.emplace(key, index);
+    // Two games with the same key ("Sonic the Hedgehog" and "Sonic the
+    // Hedgehog (XBLA)"): the one named without a bracketed tag wins.
+    if (!inserted && games_[it->second].name.find('(') != std::string::npos &&
+        games_[index].name.find('(') == std::string::npos) {
+      it->second = index;
+    }
+  };
+  for (size_t i = 0; i < games_.size(); ++i) {
+    add(games_[i].name, i);
+  }
+  for (size_t i = 0; i < games_.size(); ++i) {
+    for (const std::string& name : alternates[i]) {
+      by_key_.emplace(TitleKey(name), i);
+    }
+  }
+  return !games_.empty();
+}
+
+const LaunchBoxGame* LaunchBoxIndex::Find(const std::string& title) const {
+  auto lookup = [this](const std::string& text) -> const LaunchBoxGame* {
+    auto it = by_key_.find(TitleKey(text));
+    return it != by_key_.end() ? &games_[it->second] : nullptr;
+  };
+  if (const LaunchBoxGame* game = lookup(title)) {
+    return game;
+  }
+  for (const char* separator : {" - ", ": ", " ~ "}) {
+    size_t at = title.find(separator);
+    if (at != std::string::npos) {
+      if (const LaunchBoxGame* game = lookup(title.substr(0, at))) {
+        return game;
+      }
+    }
+  }
+  return nullptr;
+}
+
+bool LoadLaunchBoxImage(const std::string& file_name,
+                        const std::filesystem::path& cache_dir,
+                        uint32_t max_width, uint32_t max_height,
+                        std::vector<uint8_t>* out_rgba, uint32_t* out_width,
+                        uint32_t* out_height) {
+  if (file_name.empty() ||
+      file_name.find_first_of("/\\:") != std::string::npos) {
+    return false;
+  }
+  std::error_code ec;
+  std::filesystem::create_directories(cache_dir, ec);
+  std::filesystem::path path = cache_dir / xe::to_path(file_name);
+  if (!std::filesystem::exists(path, ec)) {
+    std::filesystem::path temp_path = path;
+    temp_path += ".part";
+    if (!Download(kLaunchBoxImageUrl + file_name, temp_path)) {
+      XELOGW("Dashboard: couldn't download {}", file_name);
+      return false;
+    }
+    std::filesystem::rename(temp_path, path, ec);
+    if (ec) {
+      return false;
+    }
+  }
+  std::ifstream file(path, std::ios::binary);
+  std::vector<uint8_t> encoded((std::istreambuf_iterator<char>(file)),
+                               std::istreambuf_iterator<char>());
+  std::vector<uint8_t> rgba;
+  uint32_t width = 0, height = 0;
+  if (!DecodeImageRgba(encoded.data(), encoded.size(), &rgba, &width,
+                       &height)) {
+    // A broken download - fetch it again next time.
+    std::filesystem::remove(path, ec);
+    return false;
+  }
+  // Scaled down by averaging each output pixel's share of the source.
+  float scale = std::min({1.0f, float(max_width) / float(width),
+                          float(max_height) / float(height)});
+  uint32_t new_width = std::max(1u, uint32_t(float(width) * scale + 0.5f));
+  uint32_t new_height = std::max(1u, uint32_t(float(height) * scale + 0.5f));
+  if (new_width == width && new_height == height) {
+    *out_rgba = std::move(rgba);
+  } else {
+    out_rgba->assign(size_t(new_width) * new_height * 4, 0);
+    for (uint32_t y = 0; y < new_height; ++y) {
+      uint32_t y0 = y * height / new_height;
+      uint32_t y1 = std::max(y0 + 1, (y + 1) * height / new_height);
+      for (uint32_t x = 0; x < new_width; ++x) {
+        uint32_t x0 = x * width / new_width;
+        uint32_t x1 = std::max(x0 + 1, (x + 1) * width / new_width);
+        uint32_t sum[4] = {};
+        for (uint32_t sy = y0; sy < y1; ++sy) {
+          const uint8_t* row = &rgba[(size_t(sy) * width + x0) * 4];
+          for (uint32_t sx = x0; sx < x1; ++sx, row += 4) {
+            for (int c = 0; c < 4; ++c) {
+              sum[c] += row[c];
+            }
+          }
+        }
+        uint32_t count = (y1 - y0) * (x1 - x0);
+        uint8_t* out = &(*out_rgba)[(size_t(y) * new_width + x) * 4];
+        for (int c = 0; c < 4; ++c) {
+          out[c] = uint8_t(sum[c] / count);
+        }
+      }
+    }
+  }
+  *out_width = new_width;
+  *out_height = new_height;
   return true;
 }
 

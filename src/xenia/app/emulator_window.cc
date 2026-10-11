@@ -692,10 +692,14 @@ uint16_t EmulatorWindow::GuideMenuOverlay::PollCombinedButtons() {
     return 0;
   }
   uint16_t combined = 0;
+  left_trigger_down_ = right_trigger_down_ = false;
   for (uint32_t user_index = 0; user_index < 4; ++user_index) {
     hid::X_INPUT_STATE state;
     if (input_system->GetState(user_index, &state) == X_ERROR_SUCCESS) {
       combined |= state.gamepad.buttons;
+      // Past halfway counts as pressed.
+      left_trigger_down_ |= state.gamepad.left_trigger > 128;
+      right_trigger_down_ |= state.gamepad.right_trigger > 128;
     }
   }
   return combined;
@@ -1043,6 +1047,11 @@ void EmulatorWindow::GuideMenuOverlay::OnDraw(ImGuiIO& io) {
   if (ImGui::IsKeyDown(ImGuiKey_RightBracket)) {
     buttons |= hid::X_INPUT_GAMEPAD_RIGHT_SHOULDER;
   }
+  // The triggers (letter jumps) - Page Up/Down, as on the shell.
+  bool left_trigger_down =
+      left_trigger_down_ || ImGui::IsKeyDown(ImGuiKey_PageUp);
+  bool right_trigger_down =
+      right_trigger_down_ || ImGui::IsKeyDown(ImGuiKey_PageDown);
 
   // With no title running, the overlay becomes the dashboard: always open,
   // starting on Games. Once a launched title is running it drops back to the
@@ -1139,14 +1148,26 @@ void EmulatorWindow::GuideMenuOverlay::OnDraw(ImGuiIO& io) {
   bool next_pressed =
       pressed(hid::X_INPUT_GAMEPAD_RIGHT_SHOULDER, right_shoulder_was_down_);
   bool play_pause_pressed = pressed(hid::X_INPUT_GAMEPAD_X, x_was_down_);
+  bool previous_letter_pressed =
+      left_trigger_down && !left_trigger_was_down_;
+  bool next_letter_pressed = right_trigger_down && !right_trigger_was_down_;
+  left_trigger_was_down_ = left_trigger_down;
+  right_trigger_was_down_ = right_trigger_down;
   bool is_music_tab = CurrentTab() == kMusicTab;
   bool is_games_tab = CurrentTab() == kGamesTab;
   bool is_home_tab = CurrentTab() == kHomeTab;
+  // The dashboard's Games blade is a coverflow: left/right go through the
+  // games, so the shoulder buttons switch blades instead.
+  bool coverflow = dashboard_mode && is_games_tab && !games_list_.empty();
+  if (!coverflow) {
+    letter_picker_open_ = false;
+  }
   if (input_release_wait_) {
-    if (buttons) {
+    if (buttons || left_trigger_down || right_trigger_down) {
       close_pressed = up_pressed = down_pressed = left_pressed =
           right_pressed = confirm_pressed = y_pressed = previous_pressed =
-              next_pressed = play_pause_pressed = false;
+              next_pressed = play_pause_pressed = previous_letter_pressed =
+                  next_letter_pressed = false;
     } else {
       input_release_wait_ = false;
     }
@@ -1163,9 +1184,64 @@ void EmulatorWindow::GuideMenuOverlay::OnDraw(ImGuiIO& io) {
       pending_action_ = PendingAction::kNone;
       last_action_message_.clear();
     }
+  } else if (letter_picker_open_) {
+    // The letter picker's grid: "#" and A-Z, 9 to a row.
+    constexpr int kLetters = 27, kColumns = 9;
+    int& index = letter_picker_index_;
+    if (left_pressed) {
+      index = (index + kLetters - 1) % kLetters;
+    }
+    if (right_pressed) {
+      index = (index + 1) % kLetters;
+    }
+    if (up_pressed) {
+      index = (index + kLetters - kColumns) % kLetters;
+    }
+    if (down_pressed) {
+      index = (index + kColumns) % kLetters;
+    }
+    if (confirm_pressed) {
+      // The first game at or after the letter (or the last game, past the
+      // end).
+      int target = int(games_list_.size()) - 1;
+      for (int i = 0; i < int(games_list_.size()); ++i) {
+        if (GameLetter(games_list_[i]) >= index) {
+          target = i;
+          break;
+        }
+      }
+      games_selected_index_ = target;
+      letter_picker_open_ = false;
+    } else if (close_pressed || y_pressed) {
+      letter_picker_open_ = false;
+    }
   } else {
     if (y_pressed && !dashboard_mode) {
       pending_action_ = PendingAction::kReturnToDashboard;
+    }
+    if (coverflow) {
+      if (y_pressed) {
+        letter_picker_open_ = true;
+        letter_picker_index_ = GameLetter(games_list_[std::clamp(
+            games_selected_index_, 0, int(games_list_.size()) - 1)]);
+      }
+      if (previous_letter_pressed) {
+        JumpGameLetter(-1);
+      }
+      if (next_letter_pressed) {
+        JumpGameLetter(1);
+      }
+    }
+    if (dashboard_mode) {
+      if (previous_pressed) {
+        selected_tile_ = (selected_tile_ + int(tabs_.size()) - 1) %
+                         int(tabs_.size());
+        EnterSelectedTab();
+      }
+      if (next_pressed) {
+        selected_tile_ = (selected_tile_ + 1) % int(tabs_.size());
+        EnterSelectedTab();
+      }
     }
 
     // Music transport, from any guide tab.
@@ -1196,14 +1272,25 @@ void EmulatorWindow::GuideMenuOverlay::OnDraw(ImGuiIO& io) {
     // content - matching the real Xbox Guide, where a tab shows its list as
     // soon as it's highlighted rather than needing a separate "enter"
     // confirm.
-    if (left_pressed) {
-      selected_tile_ = (selected_tile_ + int(tabs_.size()) - 1) %
-                       int(tabs_.size());
-      EnterSelectedTab();
-    }
-    if (right_pressed) {
-      selected_tile_ = (selected_tile_ + 1) % int(tabs_.size());
-      EnterSelectedTab();
+    if (coverflow) {
+      // Through the covers - no wrapping round, like a shelf.
+      int last = int(games_list_.size()) - 1;
+      if (left_pressed) {
+        games_selected_index_ = std::max(0, games_selected_index_ - 1);
+      }
+      if (right_pressed) {
+        games_selected_index_ = std::min(last, games_selected_index_ + 1);
+      }
+    } else {
+      if (left_pressed) {
+        selected_tile_ = (selected_tile_ + int(tabs_.size()) - 1) %
+                         int(tabs_.size());
+        EnterSelectedTab();
+      }
+      if (right_pressed) {
+        selected_tile_ = (selected_tile_ + 1) % int(tabs_.size());
+        EnterSelectedTab();
+      }
     }
 
     // Up/down move within the highlighted tab's own list.
@@ -1487,10 +1574,69 @@ void EmulatorWindow::GuideMenuOverlay::EnterGamesBrowser() {
     return;
   }
   ScanGamesRecursive(cvars::games_path, cvars::games_path, 0, &games_list_);
-  std::sort(games_list_.begin(), games_list_.end(),
-           [](const GameEntry& a, const GameEntry& b) {
-             return a.display_name < b.display_name;
-           });
+  // By title, as a shelf is (and as the letter picker files them), ignoring
+  // case and a leading "The"; then by file, for a game's discs.
+  auto sort_title = [](const GameEntry& game) {
+    std::string title = xe::utf8::lower_ascii(game.title);
+    if (title.rfind("the ", 0) == 0) {
+      title.erase(0, 4);
+    }
+    return title;
+  };
+  std::stable_sort(games_list_.begin(), games_list_.end(),
+                   [&](const GameEntry& a, const GameEntry& b) {
+                     std::string a_title = sort_title(a);
+                     std::string b_title = sort_title(b);
+                     if (a_title != b_title) {
+                       return a_title < b_title;
+                     }
+                     return a.display_name < b.display_name;
+                   });
+}
+
+int EmulatorWindow::GuideMenuOverlay::GameLetter(const GameEntry& game) {
+  std::string title = game.title;
+  if (xe::utf8::lower_ascii(title).rfind("the ", 0) == 0) {
+    title.erase(0, 4);
+  }
+  char first = title.empty() ? '#' : title[0];
+  if (first >= 'a' && first <= 'z') {
+    return first - 'a' + 1;
+  }
+  if (first >= 'A' && first <= 'Z') {
+    return first - 'A' + 1;
+  }
+  return 0;
+}
+
+void EmulatorWindow::GuideMenuOverlay::JumpGameLetter(int direction) {
+  int count = int(games_list_.size());
+  if (!count) {
+    return;
+  }
+  int index = std::clamp(games_selected_index_, 0, count - 1);
+  int letter = GameLetter(games_list_[index]);
+  if (direction > 0) {
+    // The first game of the next letter.
+    while (index < count && GameLetter(games_list_[index]) == letter) {
+      ++index;
+    }
+    games_selected_index_ = std::min(index, count - 1);
+  } else {
+    // The first game of this letter, or of the one before if already there.
+    int start = index;
+    while (start > 0 && GameLetter(games_list_[start - 1]) == letter) {
+      --start;
+    }
+    if (start == index && start > 0) {
+      start = index - 1;
+      int previous = GameLetter(games_list_[start]);
+      while (start > 0 && GameLetter(games_list_[start - 1]) == previous) {
+        --start;
+      }
+    }
+    games_selected_index_ = start;
+  }
 }
 
 void EmulatorWindow::GuideMenuOverlay::ConfirmGamesBrowserSelection() {
@@ -2494,9 +2640,13 @@ void EmulatorWindow::GuideMenuOverlay::DrawDashboard(ImGuiIO& io) {
   DashboardArt detail_art;
   // Settings have no picture - their details pane is just text.
   bool detail_has_art = true;
+  // The Games blade is a coverflow of box art (when there are games).
+  const bool coverflow = CurrentTab() == kGamesTab && !games_list_.empty();
   if (CurrentTab() == kGamesTab) {
     header = "Select a Game";
     EnsureGameMetadataLoading();
+    game_art_focus_ = games_selected_index_;
+    EnsureGameArtLoading();
     if (games_load_failed_) {
       empty_message = "Couldn't read games_path - see the log.";
     } else if (games_list_.empty()) {
@@ -2665,6 +2815,98 @@ void EmulatorWindow::GuideMenuOverlay::DrawDashboard(ImGuiIO& io) {
                          IM_COL32(240, 255, 230, 255),
                          blade_label(selected_tile_));
 
+    // The coverflow's backdrop: the highlighted game's background art (or,
+    // without any, its cover) filling the blade beside its label, dimmed,
+    // fading from the last game's.
+    const GameEntry* coverflow_game = nullptr;
+    const GameArt* coverflow_art = nullptr;
+    if (coverflow) {
+      int index =
+          std::clamp(games_selected_index_, 0, int(games_list_.size()) - 1);
+      coverflow_game = &games_list_[index];
+      coverflow_art = FindGameArt(coverflow_game->path);
+      std::string background_key;
+      if (coverflow_art && !coverflow_art->fanart_rgba.empty()) {
+        background_key = "lbfanart:" + coverflow_art->info.fanart;
+      } else if (coverflow_art && !coverflow_art->cover_rgba.empty()) {
+        background_key = "lbcover:" + coverflow_art->info.box_front;
+      }
+      if (background_key != coverflow_background_key_) {
+        coverflow_previous_background_key_ = coverflow_background_key_;
+        coverflow_background_key_ = background_key;
+        coverflow_background_fade_ = 0.0f;
+      }
+      coverflow_background_fade_ =
+          std::min(1.0f, coverflow_background_fade_ + io.DeltaTime * 4.0f);
+      ImVec2 b0(active_x0 + blade_width, top);
+      ImVec2 b1(active_x1, bottom);
+      auto draw_background = [&](const std::string& key, float alpha) {
+        if (key.empty() || alpha <= 0.0f) {
+          return;
+        }
+        // Textures are made when an image is first shown - its pixels are
+        // in game_art_, which never changes an entry once added.
+        void* texture =
+            emulator_window_.imgui_drawer()->GetUserTexture(key);
+        if (!texture) {
+          return;
+        }
+        // Cropped to the blade's shape, centered (object-fit: cover).
+        auto size = coverflow_background_sizes_.find(key);
+        if (size == coverflow_background_sizes_.end()) {
+          return;
+        }
+        float box_aspect = (b1.x - b0.x) / (b1.y - b0.y);
+        float image_aspect =
+            float(size->second.first) / float(std::max(1u, size->second.second));
+        ImVec2 uv0(0.0f, 0.0f), uv1(1.0f, 1.0f);
+        if (image_aspect > box_aspect) {
+          float visible = box_aspect / image_aspect;
+          uv0.x = (1.0f - visible) * 0.5f;
+          uv1.x = uv0.x + visible;
+        } else {
+          float visible = image_aspect / box_aspect;
+          uv0.y = (1.0f - visible) * 0.5f;
+          uv1.y = uv0.y + visible;
+        }
+        dl->AddImageRounded(texture, b0, b1, uv0, uv1,
+                            IM_COL32(255, 255, 255, int(255 * alpha)),
+                            rounding, ImDrawFlags_RoundCornersRight);
+      };
+      // Make sure the current backdrop's texture exists.
+      if (coverflow_art) {
+        DashboardArt backdrop;
+        if (!coverflow_art->fanart_rgba.empty()) {
+          backdrop.key = "lbfanart:" + coverflow_art->info.fanart;
+          backdrop.rgba = &coverflow_art->fanart_rgba;
+          backdrop.width = coverflow_art->fanart_width;
+          backdrop.height = coverflow_art->fanart_height;
+        } else if (!coverflow_art->cover_rgba.empty()) {
+          backdrop.key = "lbcover:" + coverflow_art->info.box_front;
+          backdrop.rgba = &coverflow_art->cover_rgba;
+          backdrop.width = coverflow_art->cover_width;
+          backdrop.height = coverflow_art->cover_height;
+        }
+        if (backdrop.rgba && ArtTexture(backdrop)) {
+          coverflow_background_sizes_[backdrop.key] = {backdrop.width,
+                                                       backdrop.height};
+        }
+      }
+      draw_background(coverflow_previous_background_key_,
+                      1.0f - coverflow_background_fade_);
+      draw_background(coverflow_background_key_, coverflow_background_fade_);
+      // Dimmed for the text and covers over it - more toward the bottom.
+      dl->AddRectFilled(b0, b1, IM_COL32(8, 14, 6, 140), rounding,
+                        ImDrawFlags_RoundCornersRight);
+      dl->AddRectFilledMultiColor(
+          ImVec2(b0.x, (b0.y + b1.y) * 0.5f),
+          ImVec2(b1.x - rounding, b1.y - rounding), IM_COL32(0, 0, 0, 0),
+          IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 110),
+          IM_COL32(0, 0, 0, 110));
+      dl->AddRect(ImVec2(active_x0, top), ImVec2(active_x1, bottom),
+                  IM_COL32(44, 112, 16, 255), rounding, 0, 2.0f * s);
+    }
+
     // Content area inside the active blade.
     const float cx0 = active_x0 + blade_width + 14.0f * s;
     const float cx1 = active_x1 - 18.0f * s;
@@ -2741,14 +2983,30 @@ void EmulatorWindow::GuideMenuOverlay::DrawDashboard(ImGuiIO& io) {
       };
       draw_button(IM_COL32(40, 150, 30, 255), "A",
                   CurrentTab() == kGamesTab ? "Play" : "Select");
+      if (coverflow) {
+        draw_button(IM_COL32(220, 170, 20, 255), "Y", "Letters");
+      }
       if (CurrentTab() == kMusicTab && music_nav_stack_.size() > 1) {
         draw_button(IM_COL32(196, 36, 36, 255), "B", "Back");
       } else if (IsInShell()) {
         draw_button(IM_COL32(196, 36, 36, 255), "B", "Turn Off");
       }
-      std::string status = last_action_message_.empty()
-                               ? "Left / Right: switch blades"
-                               : last_action_message_;
+      std::string status = last_action_message_;
+      if (status.empty() && coverflow) {
+        status = fmt::format(
+            "{} of {}   LB / RB: blades   LT / RT: letters",
+            std::clamp(games_selected_index_, 0,
+                       int(games_list_.size()) - 1) +
+                1,
+            games_list_.size());
+        if (game_art_status_ == GameArtStatus::kPreparing) {
+          status = "Getting box art (the first time takes a few minutes)...";
+        } else if (game_art_status_ == GameArtStatus::kFailed) {
+          status = "Couldn't get box art - see xenia.log.";
+        }
+      } else if (status.empty()) {
+        status = "Left / Right or LB / RB: switch blades";
+      }
       float status_size = 20.0f * s;
       dl->PushClipRect(ImVec2(cx0, footer_y0), ImVec2(x, footer_y1), true);
       AddShadowedText(dl, font, status_size,
@@ -2769,7 +3027,281 @@ void EmulatorWindow::GuideMenuOverlay::DrawDashboard(ImGuiIO& io) {
     const float row_gap = 5.0f * s;
     const float title_size = 23.0f * s;
     const float subtitle_size = 18.0f * s;
-    if (rows.empty()) {
+    if (coverflow) {
+      // Covers on a shelf: the highlighted one big in the middle, the
+      // others smaller to each side and fading out toward the edges, each
+      // reflected in the floor - easing along as the highlight moves.
+      int count = int(games_list_.size());
+      int selected = std::clamp(games_selected_index_, 0, count - 1);
+      float target = float(selected);
+      float step = std::min(1.0f, io.DeltaTime * 12.0f);
+      coverflow_position_ += (target - coverflow_position_) * step;
+      if (std::abs(target - coverflow_position_) < 0.001f) {
+        coverflow_position_ = target;
+      }
+      // Far jumps (a letter) skip most of the way at once.
+      if (std::abs(target - coverflow_position_) > 4.0f) {
+        coverflow_position_ =
+            target + (coverflow_position_ > target ? 4.0f : -4.0f);
+      }
+
+      const float body_height = body_y1 - body_y0;
+      const float cover_h = body_height * 0.5f;
+      const float cover_w = cover_h * 0.70f;
+      const float floor_y = body_y0 + 12.0f * s + cover_h;
+      const float reflection_h = cover_h * 0.2f;
+      const float mid_x = (cx0 + cx1) * 0.5f;
+      const float near_spacing = cover_w * 0.95f;
+      const float far_spacing = cover_w * 0.6f;
+
+      auto cover_art = [&](int index) {
+        DashboardArt art;
+        const GameEntry& game = games_list_[index];
+        if (const GameArt* loaded = FindGameArt(game.path)) {
+          if (!loaded->cover_rgba.empty()) {
+            art.key = "lbcover:" + loaded->info.box_front;
+            art.rgba = &loaded->cover_rgba;
+            art.width = loaded->cover_width;
+            art.height = loaded->cover_height;
+          }
+        }
+        return art;
+      };
+      auto display_title = [&](int index) {
+        const GameEntry& game = games_list_[index];
+        const GameArt* loaded = FindGameArt(game.path);
+        if (loaded && loaded->matched && !loaded->info.name.empty()) {
+          return loaded->info.name;
+        }
+        const GameMetadata* metadata = FindGameMetadata(game.path);
+        return metadata && !metadata->title.empty() ? metadata->title
+                                                     : game.title;
+      };
+
+      // Farthest first, so nearer covers overlap them.
+      std::vector<int> visible;
+      for (int i = int(std::floor(coverflow_position_)) - 6;
+           i <= int(std::ceil(coverflow_position_)) + 6; ++i) {
+        if (i >= 0 && i < count) {
+          visible.push_back(i);
+        }
+      }
+      std::sort(visible.begin(), visible.end(), [&](int a, int b) {
+        return std::abs(a - coverflow_position_) >
+               std::abs(b - coverflow_position_);
+      });
+      dl->PushClipRect(ImVec2(cx0, body_y0), ImVec2(cx1, body_y1), true);
+      for (int i : visible) {
+        float d = float(i) - coverflow_position_;
+        float distance = std::abs(d);
+        float side = d < 0.0f ? -1.0f : 1.0f;
+        float offset = side * (std::min(distance, 1.0f) * near_spacing +
+                               std::max(distance - 1.0f, 0.0f) * far_spacing);
+        float scale = 1.0f - 0.26f * std::min(distance, 1.0f);
+        float w = cover_w * scale;
+        float h = cover_h * scale;
+        float x0 = mid_x + offset - w * 0.5f;
+        float x1 = x0 + w;
+        if (x1 < cx0 || x0 > cx1) {
+          continue;
+        }
+        // Fading out toward the blade's edges.
+        float edge = std::min(x0 - cx0, cx1 - x1) + w * 0.5f;
+        float alpha = std::clamp(edge / (w * 0.9f), 0.0f, 1.0f);
+        if (alpha <= 0.0f) {
+          continue;
+        }
+        // The ones to the sides a little darker.
+        int shade = 255 - int(70.0f * std::min(distance, 1.0f));
+        ImU32 tint = IM_COL32(shade, shade, shade, int(255 * alpha));
+        ImVec2 p0(x0, floor_y - h);
+        ImVec2 p1(x1, floor_y);
+        dl->AddRectFilled(ImVec2(p0.x + 6.0f * s, p0.y + 8.0f * s),
+                          ImVec2(p1.x + 6.0f * s, p1.y + 4.0f * s),
+                          IM_COL32(0, 0, 0, int(110 * alpha)), 4.0f * s);
+        DashboardArt art = cover_art(i);
+        void* texture = art.rgba ? ArtTexture(art) : nullptr;
+        if (texture) {
+          dl->AddImage(texture, p0, p1, ImVec2(0.0f, 0.0f),
+                       ImVec2(1.0f, 1.0f), tint);
+          // The reflection: the bottom of the cover, upside down, fading
+          // to nothing.
+          float fraction = reflection_h * scale / h;
+          ImVec2 r0(p0.x, p1.y + 2.0f * s);
+          ImVec2 r1(p1.x, r0.y + reflection_h * scale);
+          dl->PushTextureID(texture);
+          dl->PrimReserve(6, 4);
+          dl->PrimQuadUV(r0, ImVec2(r1.x, r0.y), r1, ImVec2(r0.x, r1.y),
+                         ImVec2(0.0f, 1.0f), ImVec2(1.0f, 1.0f),
+                         ImVec2(1.0f, 1.0f - fraction),
+                         ImVec2(0.0f, 1.0f - fraction),
+                         IM_COL32(shade, shade, shade, int(80 * alpha)));
+          dl->_VtxWritePtr[-1].col = IM_COL32(shade, shade, shade, 0);
+          dl->_VtxWritePtr[-2].col = IM_COL32(shade, shade, shade, 0);
+          dl->PopTextureID();
+        } else {
+          DrawArtPlaceholder(dl, font, p0, p1, ArtPlaceholder::kInitials,
+                             display_title(i));
+          if (alpha < 1.0f || shade < 255) {
+            // Placeholders can't be tinted - shade them over instead.
+            dl->AddRectFilled(
+                p0, p1,
+                IM_COL32(0, 0, 0,
+                         int(255 - float(shade) * alpha)));
+          }
+        }
+        if (distance < 0.5f) {
+          dl->AddRect(ImVec2(p0.x - 3.0f * s, p0.y - 3.0f * s),
+                      ImVec2(p1.x + 3.0f * s, p1.y + 3.0f * s),
+                      IM_COL32(150, 230, 90, 200), 3.0f * s, 0, 3.0f * s);
+          dl->AddRect(p0, p1, IM_COL32(255, 255, 255, 230), 0.0f, 0,
+                      1.5f * s);
+        } else {
+          dl->AddRect(p0, p1, IM_COL32(0, 0, 0, int(120 * alpha)), 0.0f, 0,
+                      1.0f * s);
+        }
+      }
+      dl->PopClipRect();
+
+      // The highlighted game's details, under the shelf.
+      const GameEntry& game = games_list_[selected];
+      const GameArt* art = FindGameArt(game.path);
+      std::string title = display_title(selected);
+      float y = floor_y + reflection_h * 0.75f;
+      float text_width = (cx1 - cx0) * 0.86f;
+      float text_x0 = mid_x - text_width * 0.5f;
+      auto centered = [&](float size, ImU32 color, const std::string& text) {
+        ImVec2 extent = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text.c_str());
+        float x = std::max(text_x0, mid_x - extent.x * 0.5f);
+        dl->PushClipRect(ImVec2(text_x0, y), ImVec2(text_x0 + text_width,
+                                                     y + size * 1.4f),
+                         true);
+        AddShadowedText(dl, font, size, ImVec2(x, y), color, text);
+        dl->PopClipRect();
+        y += size * 1.25f;
+      };
+      centered(30.0f * s, IM_COL32(255, 255, 255, 255), title);
+      // Year, who made it, and the file's own tags (region, disc).
+      std::vector<std::string> parts;
+      if (art && art->matched) {
+        if (art->info.release_date.size() >= 4) {
+          parts.push_back(art->info.release_date.substr(0, 4));
+        }
+        if (!art->info.developer.empty()) {
+          parts.push_back(art->info.developer);
+        }
+        if (!art->info.publisher.empty() &&
+            art->info.publisher != art->info.developer) {
+          parts.push_back(art->info.publisher);
+        }
+      }
+      if (!game.tags.empty()) {
+        parts.push_back(game.tags);
+      }
+      std::string line;
+      for (const std::string& part : parts) {
+        line += (line.empty() ? "" : "  \xC2\xB7  ") + part;
+      }
+      if (!line.empty()) {
+        centered(19.0f * s, IM_COL32(220, 240, 210, 255), line);
+      }
+      line.clear();
+      if (art && art->matched) {
+        std::string genres = art->info.genres;
+        for (size_t at; (at = genres.find(';')) != std::string::npos;) {
+          genres.replace(at, 1, ",");
+        }
+        line = genres;
+        if (!art->info.players.empty()) {
+          line += (line.empty() ? "" : "  \xC2\xB7  ") +
+                  (art->info.players == "1"
+                       ? std::string("1 player")
+                       : "1-" + art->info.players + " players");
+        }
+      }
+      if (!line.empty()) {
+        centered(18.0f * s, IM_COL32(190, 215, 180, 255), line);
+      }
+      // The description, as much as fits.
+      if (art && art->matched && !art->info.overview.empty() &&
+          body_y1 - y > 40.0f * s) {
+        y += 6.0f * s;
+        ImVec2 o0(text_x0, y);
+        ImVec2 o1(text_x0 + text_width, body_y1);
+        dl->AddRectFilled(o0, o1, IM_COL32(0, 0, 0, 90), 10.0f * s);
+        dl->PushClipRect(ImVec2(o0.x + 14.0f * s, o0.y + 8.0f * s),
+                         ImVec2(o1.x - 14.0f * s, o1.y - 8.0f * s), true);
+        std::string overview = art->info.overview;
+        for (char& c : overview) {
+          if (c == '\n') {
+            c = ' ';
+          }
+        }
+        // Too long for the box, it scrolls: a few seconds at the top, slowly
+        // down to the end, a few seconds there, then back to the top - from
+        // the start again for each game.
+        const float overview_size = 17.0f * s;
+        const float wrap_width = text_width - 28.0f * s;
+        // Its height by counting lines as drawing wraps them (word by word,
+        // dropping the spaces at each break) - CalcTextSizeA comes up short.
+        float text_height = 0.0f;
+        std::vector<size_t> line_starts;
+        {
+          float wrap_scale = overview_size / font->FontSize;
+          const char* begin = overview.c_str();
+          const char* p = begin;
+          const char* end = p + overview.size();
+          while (p < end) {
+            line_starts.push_back(size_t(p - begin));
+            const char* eol =
+                font->CalcWordWrapPositionA(wrap_scale, p, end, wrap_width);
+            if (eol <= p) {
+              eol = p + 1;
+            }
+            text_height += overview_size;
+            p = eol;
+            while (p < end && (*p == ' ' || *p == '\t')) {
+              ++p;
+            }
+          }
+        }
+        float visible = (o1.y - o0.y) - 16.0f * s;
+        if (overview_scroll_game_ != selected) {
+          overview_scroll_game_ = selected;
+          overview_scroll_start_ = std::chrono::steady_clock::now();
+        }
+        // From the clock, not summed frame times (which drift here).
+        float shown_for = std::chrono::duration<float>(
+                              std::chrono::steady_clock::now() -
+                              overview_scroll_start_)
+                              .count();
+        float scroll = 0.0f;
+        float overflow = text_height - visible;
+        if (overflow > 0.0f) {
+          const float pause = 3.0f;
+          const float speed = 18.0f * s;  // Per second.
+          float cycle = pause + overflow / speed + pause;
+          float t = std::fmod(shown_for, cycle);
+          scroll = std::clamp((t - pause) * speed, 0.0f, overflow);
+        }
+        // Drawn from the first line still on screen: ImGui 1.89 mishandles
+        // skipping wrapped lines above the clip rect when the text has no
+        // line breaks (the text snaps back a line once one scrolls off).
+        size_t first_line = std::min(size_t(scroll / overview_size),
+                                     line_starts.empty()
+                                         ? size_t(0)
+                                         : line_starts.size() - 1);
+        AddShadowedText(
+            dl, font, overview_size,
+            ImVec2(o0.x + 14.0f * s,
+                   o0.y + 8.0f * s - scroll + first_line * overview_size),
+            IM_COL32(235, 245, 230, 255),
+            line_starts.empty() ? overview
+                                : overview.substr(line_starts[first_line]),
+            wrap_width);
+        dl->PopClipRect();
+      }
+    } else if (rows.empty()) {
       AddShadowedText(dl, font, 22.0f * s,
                       ImVec2(list_x0 + 20.0f * s, body_y0 + 16.0f * s),
                       IM_COL32(255, 255, 255, 255), empty_message,
@@ -2888,7 +3420,7 @@ void EmulatorWindow::GuideMenuOverlay::DrawDashboard(ImGuiIO& io) {
     }
 
     // Details pane: a large stand-in art tile, then the description.
-    if (!detail_title.empty()) {
+    if (!coverflow && !detail_title.empty()) {
       float art_height =
           detail_has_art
               ? std::min((pane_x1 - pane_x0) * 0.56f,
@@ -2952,6 +3484,64 @@ void EmulatorWindow::GuideMenuOverlay::DrawDashboard(ImGuiIO& io) {
       dl->PopClipRect();
     }
 
+    // The letter picker: "#" and A-Z, those with no games greyed out.
+    if (letter_picker_open_ && coverflow) {
+      bool has_games[27] = {};
+      for (const GameEntry& game : games_list_) {
+        has_games[GameLetter(game)] = true;
+      }
+      dl->AddRectFilled(ImVec2(0.0f, 0.0f), io.DisplaySize,
+                        IM_COL32(0, 0, 0, 110));
+      const int columns = 9;
+      const float cell = 62.0f * s;
+      const float gap = 8.0f * s;
+      float grid_w = columns * cell + (columns - 1) * gap;
+      float grid_h = 3 * cell + 2 * gap;
+      float box_w = grid_w + 60.0f * s;
+      float box_h = grid_h + 150.0f * s;
+      ImVec2 b0(width * 0.5f - box_w * 0.5f, height * 0.5f - box_h * 0.5f);
+      ImVec2 b1(b0.x + box_w, b0.y + box_h);
+      dl->AddRectFilled(ImVec2(b0.x + 8.0f * s, b0.y + 8.0f * s),
+                        ImVec2(b1.x + 8.0f * s, b1.y + 8.0f * s),
+                        IM_COL32(0, 0, 0, 90), 14.0f * s);
+      dl->AddRectFilled(b0, b1, IM_COL32(28, 40, 24, 245), 14.0f * s);
+      dl->AddRect(b0, b1, IM_COL32(150, 230, 90, 200), 14.0f * s, 0,
+                  2.0f * s);
+      AddShadowedText(dl, font, 28.0f * s,
+                      ImVec2(b0.x + 30.0f * s, b0.y + 20.0f * s),
+                      IM_COL32(255, 255, 255, 255), "Jump to a Letter");
+      float gx = b0.x + 30.0f * s;
+      float gy = b0.y + 72.0f * s;
+      for (int i = 0; i < 27; ++i) {
+        ImVec2 c0(gx + (i % columns) * (cell + gap),
+                  gy + (i / columns) * (cell + gap));
+        ImVec2 c1(c0.x + cell, c0.y + cell);
+        bool chosen = i == letter_picker_index_;
+        dl->AddRectFilled(c0, c1,
+                          chosen ? IM_COL32(110, 200, 50, 255)
+                                 : IM_COL32(255, 255, 255, 22),
+                          8.0f * s);
+        if (chosen) {
+          dl->AddRect(c0, c1, IM_COL32(255, 255, 255, 230), 8.0f * s, 0,
+                      2.0f * s);
+        }
+        char text[2] = {i ? char('A' + i - 1) : '#', 0};
+        float size = 30.0f * s;
+        ImVec2 extent = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
+        dl->AddText(font, size,
+                    ImVec2((c0.x + c1.x - extent.x) * 0.5f,
+                           (c0.y + c1.y - extent.y) * 0.5f),
+                    chosen          ? IM_COL32(20, 40, 10, 255)
+                    : has_games[i] ? IM_COL32(255, 255, 255, 255)
+                                   : IM_COL32(255, 255, 255, 70),
+                    text);
+      }
+      dl->AddText(font, 20.0f * s,
+                  ImVec2(b0.x + 30.0f * s, b1.y - 44.0f * s),
+                  IM_COL32(210, 230, 200, 255),
+                  "A  Jump      B  Back");
+    }
+
     // Turn-off confirmation (inside a shell), over everything.
     if (pending_action_ == PendingAction::kTurnOff) {
       dl->AddRectFilled(ImVec2(0.0f, 0.0f), io.DisplaySize,
@@ -2995,6 +3585,9 @@ EmulatorWindow::GuideMenuOverlay::~GuideMenuOverlay() {
   music_image_cv_.notify_all();
   if (game_metadata_thread_.joinable()) {
     game_metadata_thread_.join();
+  }
+  if (game_art_thread_.joinable()) {
+    game_art_thread_.join();
   }
   if (music_image_thread_.joinable()) {
     music_image_thread_.join();
@@ -3139,10 +3732,107 @@ const GameMetadata* EmulatorWindow::GuideMenuOverlay::FindGameMetadata(
   return &it->second.data;
 }
 
+void EmulatorWindow::GuideMenuOverlay::EnsureGameArtLoading() {
+  if (game_art_thread_running_ || games_list_.empty() ||
+      game_art_status_ == GameArtStatus::kFailed) {
+    return;
+  }
+  // The games with no art yet, with the titles to look them up by - the
+  // file's, and the game's own once read (they differ: "MLB 2K12").
+  struct Pending {
+    std::filesystem::path path;
+    std::string title;
+    std::string official_title;
+    // Where it is in the list (the loader can't look at the list itself).
+    int index;
+  };
+  std::vector<Pending> pending;
+  {
+    std::lock_guard<std::mutex> lock(game_art_mutex_);
+    for (int i = 0; i < int(games_list_.size()); ++i) {
+      const GameEntry& game = games_list_[i];
+      if (!game_art_.count(xe::path_to_utf8(game.path))) {
+        const GameMetadata* metadata = FindGameMetadata(game.path);
+        pending.push_back({game.path, game.title,
+                           metadata ? metadata->title : std::string(), i});
+      }
+    }
+  }
+  if (pending.empty()) {
+    return;
+  }
+  if (game_art_thread_.joinable()) {
+    game_art_thread_.join();  // Already finished its previous batch.
+  }
+  std::filesystem::path cache_dir =
+      emulator_window_.emulator()->cache_root() / "dashboard";
+  game_art_thread_running_ = true;
+  game_art_thread_ = std::thread([this, pending = std::move(pending),
+                                  cache_dir]() mutable {
+    xe::threading::set_name("Dashboard Game Art");
+    if (!launchbox_index_loaded_) {
+      game_art_status_ = GameArtStatus::kPreparing;
+      launchbox_index_loaded_ = true;
+      if (!launchbox_index_.Load(cache_dir, game_metadata_stop_)) {
+        game_art_status_ = GameArtStatus::kFailed;
+        game_art_thread_running_ = false;
+        return;
+      }
+    }
+    game_art_status_ = GameArtStatus::kReady;
+    std::filesystem::path images_dir = cache_dir / "launchbox";
+    while (!pending.empty() && !game_metadata_stop_) {
+      // Nearest the highlighted game first, as the list is scrolled.
+      int focus = game_art_focus_;
+      size_t next = 0;
+      int best = INT_MAX;
+      for (size_t i = 0; i < pending.size(); ++i) {
+        int distance = std::abs(pending[i].index - focus);
+        if (distance < best) {
+          best = distance;
+          next = i;
+        }
+      }
+      Pending game = std::move(pending[next]);
+      pending.erase(pending.begin() + next);
+
+      GameArt art;
+      const LaunchBoxGame* info = launchbox_index_.Find(game.title);
+      if (!info && !game.official_title.empty()) {
+        info = launchbox_index_.Find(game.official_title);
+      }
+      if (info) {
+        art.matched = true;
+        art.info = *info;
+        // Covers sized for the largest one on screen; the background is
+        // dimmed behind everything, so smaller.
+        LoadLaunchBoxImage(info->box_front, images_dir, 400, 560,
+                           &art.cover_rgba, &art.cover_width,
+                           &art.cover_height);
+        LoadLaunchBoxImage(info->fanart, images_dir, 960, 540,
+                           &art.fanart_rgba, &art.fanart_width,
+                           &art.fanart_height);
+      }
+      std::lock_guard<std::mutex> lock(game_art_mutex_);
+      game_art_.emplace(xe::path_to_utf8(game.path), std::move(art));
+    }
+    game_art_thread_running_ = false;
+  });
+}
+
+const EmulatorWindow::GuideMenuOverlay::GameArt*
+EmulatorWindow::GuideMenuOverlay::FindGameArt(
+    const std::filesystem::path& path) {
+  std::lock_guard<std::mutex> lock(game_art_mutex_);
+  auto it = game_art_.find(xe::path_to_utf8(path));
+  return it != game_art_.end() ? &it->second : nullptr;
+}
+
 void EmulatorWindow::GuideMenuOverlay::ResetBrowsingState() {
   music_nav_stack_.clear();
   games_list_.clear();
   games_list_loaded_ = false;
+  letter_picker_open_ = false;
 }
 
 void EmulatorWindow::GuideMenuOverlay::StartLeaveInPlace() {

@@ -292,6 +292,67 @@ class EmulatorWindow {
     std::atomic<bool> game_metadata_thread_running_{false};
     std::atomic<bool> game_metadata_stop_{false};
 
+    // Box art, background art and details for the Games blade's coverflow,
+    // from the LaunchBox Games Database (see LaunchBoxIndex), loaded in the
+    // background nearest the highlighted game first. Like game_metadata_,
+    // entries are inserted complete and never changed or erased after.
+    struct GameArt {
+      bool matched = false;
+      LaunchBoxGame info;
+      std::vector<uint8_t> cover_rgba;
+      uint32_t cover_width = 0;
+      uint32_t cover_height = 0;
+      std::vector<uint8_t> fanart_rgba;
+      uint32_t fanart_width = 0;
+      uint32_t fanart_height = 0;
+    };
+    enum class GameArtStatus { kIdle, kPreparing, kReady, kFailed };
+    // Starts the loader for any games with no art entry yet. Cheap - call
+    // every frame.
+    void EnsureGameArtLoading();
+    // Null until loaded.
+    const GameArt* FindGameArt(const std::filesystem::path& path);
+    std::mutex game_art_mutex_;
+    std::unordered_map<std::string, GameArt> game_art_;
+    std::thread game_art_thread_;
+    std::atomic<bool> game_art_thread_running_{false};
+    std::atomic<GameArtStatus> game_art_status_{GameArtStatus::kIdle};
+    // The highlighted game, for the loader to work outward from.
+    std::atomic<int> game_art_focus_{0};
+    // Only touched by the loader thread.
+    LaunchBoxIndex launchbox_index_;
+    bool launchbox_index_loaded_ = false;
+
+    // The Games blade's coverflow (the dashboard's, not the in-game guide's
+    // list): where it's scrolled to, easing toward the highlighted game, and
+    // the background art fading from one game's to the next.
+    float coverflow_position_ = 0.0f;
+    std::string coverflow_background_key_;
+    std::string coverflow_previous_background_key_;
+    float coverflow_background_fade_ = 1.0f;
+    // The description's scrolling (when it's too long for its box): which
+    // game it's for, and how long that's been shown.
+    int overview_scroll_game_ = -1;
+    std::chrono::steady_clock::time_point overview_scroll_start_;
+    // The backdrops' sizes by texture key, for cropping the one fading out.
+    std::unordered_map<std::string, std::pair<uint32_t, uint32_t>>
+        coverflow_background_sizes_;
+    // The letter picker (Y): jumps to the first game starting with a
+    // letter. 0 is "#" (digits and symbols), 1-26 A-Z.
+    bool letter_picker_open_ = false;
+    int letter_picker_index_ = 0;
+    // The letter group (0-26, as above) a game's title files under.
+    static int GameLetter(const GameEntry& game);
+    // Moves the highlight to the first game of the next (or previous) letter
+    // group with games.
+    void JumpGameLetter(int direction);
+    // The triggers as buttons (LT/RT jump between letters), from the last
+    // PollCombinedButtons.
+    bool left_trigger_down_ = false;
+    bool right_trigger_down_ = false;
+    bool left_trigger_was_down_ = false;
+    bool right_trigger_was_down_ = false;
+
     // Artwork for the Music blade (artist photos, album covers), fetched from
     // Music Assistant's image proxy on a background thread and cached on disk
     // under cache_root/dashboard/music. Like game_metadata_, entries are
