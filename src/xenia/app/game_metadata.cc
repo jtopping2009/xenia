@@ -110,9 +110,9 @@ bool DecodeIconPng(const uint8_t* png, size_t png_size, GameMetadata* out) {
 }
 
 // Reads metadata from an in-memory default.xex. `icon_png` gets the icon's
-// original PNG bytes, for the cache.
+// original PNG bytes, and `xdbf` (if not null) the whole XDBF, for the cache.
 bool ReadFromXex(const uint8_t* xex, size_t xex_size, GameMetadata* out,
-                 std::vector<uint8_t>* icon_png) {
+                 std::vector<uint8_t>* icon_png, std::vector<uint8_t>* xdbf) {
   std::vector<uint8_t> image;
   uint32_t base_address = 0;
   if (!cpu::XexModule::DecodeImageToHost(xex, xex_size, &image,
@@ -136,6 +136,9 @@ bool ReadFromXex(const uint8_t* xex, size_t xex_size, GameMetadata* out,
   if (!db.is_valid()) {
     return false;
   }
+  if (xdbf) {
+    xdbf->assign(xdbf_data, xdbf_data + xdbf_size);
+  }
   // English when the game has it (some, like Lost Odyssey, default to
   // Japanese, which the dashboard font can't draw), else its default.
   out->title = db.title(XLanguage::kEnglish);
@@ -151,7 +154,8 @@ bool ReadFromXex(const uint8_t* xex, size_t xex_size, GameMetadata* out,
 }
 
 bool ReadGameMetadata(const std::filesystem::path& game_path,
-                      GameMetadata* out, std::vector<uint8_t>* icon_png) {
+                      GameMetadata* out, std::vector<uint8_t>* icon_png,
+                      std::vector<uint8_t>* xdbf) {
   auto extension =
       xe::utf8::lower_ascii(xe::path_to_utf8(game_path.extension()));
   if (extension == ".iso") {
@@ -166,7 +170,7 @@ bool ReadGameMetadata(const std::filesystem::path& game_path,
       return false;
     }
     return ReadFromXex(entry->mmap()->data() + entry->data_offset(),
-                       entry->data_size(), out, icon_png);
+                       entry->data_size(), out, icon_png, xdbf);
   }
   // An extracted game's default.xex, or a loose .xex.
   auto mapping =
@@ -174,7 +178,7 @@ bool ReadGameMetadata(const std::filesystem::path& game_path,
   if (!mapping) {
     return false;
   }
-  return ReadFromXex(mapping->data(), mapping->size(), out, icon_png);
+  return ReadFromXex(mapping->data(), mapping->size(), out, icon_png, xdbf);
 }
 
 std::string CacheKey(const std::filesystem::path& game_path) {
@@ -187,6 +191,13 @@ std::string CacheKey(const std::filesystem::path& game_path) {
       fmt::format("{}|{}|{}", xe::path_to_utf8(game_path), size,
                   ec ? 0 : modified.time_since_epoch().count());
   return fmt::format("{:016x}", uint64_t(std::hash<std::string>()(identity)));
+}
+
+void WriteFile(const std::filesystem::path& path,
+               const std::vector<uint8_t>& data) {
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  file.write(reinterpret_cast<const char*>(data.data()),
+             std::streamsize(data.size()));
 }
 
 }  // namespace
@@ -237,8 +248,8 @@ bool LoadGameMetadataCached(const std::filesystem::path& game_path,
     }
   }
 
-  std::vector<uint8_t> icon_png;
-  bool found = ReadGameMetadata(game_path, out, &icon_png);
+  std::vector<uint8_t> icon_png, xdbf;
+  bool found = ReadGameMetadata(game_path, out, &icon_png, &xdbf);
   XELOGI("Dashboard: metadata for {}: {}", xe::path_to_utf8(game_path),
          found ? fmt::format("{:08X} \"{}\"", out->title_id, out->title)
                : std::string("none found"));
@@ -266,10 +277,42 @@ bool LoadGameMetadataCached(const std::filesystem::path& game_path,
        << fmt::format("{:08X}", out->title_id) << "\n"
        << title << "\n";
   if (!icon_png.empty()) {
-    std::ofstream icon(icon_path, std::ios::binary | std::ios::trunc);
-    icon.write(reinterpret_cast<const char*>(icon_png.data()),
-               std::streamsize(icon_png.size()));
+    WriteFile(icon_path, icon_png);
   }
+  if (!xdbf.empty()) {
+    WriteFile(cache_dir / (key + ".xdbf"), xdbf);
+  }
+  return true;
+}
+
+bool LoadGameXdbfCached(const std::filesystem::path& game_path,
+                        const std::filesystem::path& cache_dir,
+                        std::vector<uint8_t>* out) {
+  out->clear();
+  // Saved with the metadata - but not by builds before it was, so read it
+  // from the game again if it's missing.
+  std::filesystem::path xdbf_path =
+      cache_dir / (CacheKey(game_path) + ".xdbf");
+  {
+    std::ifstream file(xdbf_path, std::ios::binary);
+    if (file) {
+      out->assign(std::istreambuf_iterator<char>(file),
+                  std::istreambuf_iterator<char>());
+      if (!out->empty()) {
+        return true;
+      }
+    }
+  }
+  GameMetadata metadata;
+  std::vector<uint8_t> icon_png;
+  if (!ReadGameMetadata(game_path, &metadata, &icon_png, out) ||
+      out->empty()) {
+    out->clear();
+    return false;
+  }
+  std::error_code ec;
+  std::filesystem::create_directories(cache_dir, ec);
+  WriteFile(xdbf_path, *out);
   return true;
 }
 

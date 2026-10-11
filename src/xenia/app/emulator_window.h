@@ -27,6 +27,7 @@
 #include "xenia/emulator.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/hid/input.h"
+#include "xenia/kernel/xam/achievements.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
 #include "xenia/ui/immediate_drawer.h"
@@ -436,6 +437,8 @@ class EmulatorWindow {
     static constexpr int kHomeTab = 2;
     // Graphics and display settings, like the 360's System Settings blade.
     static constexpr int kSettingsTab = 3;
+    // In-game guide only - the running game's achievements.
+    static constexpr int kAchievementsTab = 4;
     std::vector<int> tabs_;
     std::vector<std::string> tile_names_;
     int CurrentTab() const { return tabs_[selected_tile_]; }
@@ -546,6 +549,79 @@ class EmulatorWindow {
     bool games_list_loaded_ = false;
     bool games_load_failed_ = false;
     int games_selected_index_ = 0;
+
+    // Achievements (see kernel/xam/achievements.h): a game's list, each with
+    // its picture decoded, for the guide's Achievements tab and the
+    // dashboard's achievements panel.
+    struct GameAchievements {
+      uint32_t title_id = 0;
+      std::vector<kernel::xam::AchievementInfo> list;
+      struct Icon {
+        std::vector<uint8_t> rgba;
+        uint32_t width = 0;
+        uint32_t height = 0;
+      };
+      // Parallel to list.
+      std::vector<Icon> icons;
+    };
+    static void ReadGameAchievements(const kernel::util::XdbfGameData& db,
+                                     uint32_t title_id, GameAchievements* out);
+    // What's been unlocked in a title - read from disk the first time it's
+    // asked for after the guide or dashboard opens (ResetBrowsingState
+    // forgets it), so it's current without being read every frame.
+    const kernel::xam::AchievementProgress& AchievementProgressFor(
+        uint32_t title_id);
+    std::unordered_map<uint32_t, kernel::xam::AchievementProgress>
+        achievement_progress_;
+    // Draws a list of achievements in p0-p1 - pictures, names, descriptions
+    // (hidden for locked secret ones), gamerscore and when each was unlocked
+    // - scrolled to keep `selected` in view. `light` for the guide's white
+    // panel, otherwise for the dashboard's dark one.
+    void DrawAchievementList(ImDrawList* dl, ImFont* font, float s, float x0,
+                             float y0, float x1, float y1,
+                              const GameAchievements& achievements,
+                             const kernel::xam::AchievementProgress& progress,
+                             int selected, bool light);
+    // "12 of 50 unlocked  ·  120 / 1000 G".
+    static std::string AchievementSummary(
+        const GameAchievements& achievements,
+        const kernel::xam::AchievementProgress& progress);
+
+    // The guide's Achievements tab: the running game's, read when the tab is
+    // first shown for it.
+    void LoadTitleAchievements();
+    GameAchievements title_achievements_;
+    bool title_achievements_loaded_ = false;
+    int achievements_selected_index_ = 0;
+
+    // The dashboard's: read in the background (uncached, from the game
+    // itself) for the highlighted game. Like game_art_, entries are inserted
+    // complete and never changed or erased after.
+    void EnsureGameAchievementsLoading();
+    // Null until loaded.
+    const GameAchievements* FindGameAchievements(
+        const std::filesystem::path& path);
+    std::mutex game_achievements_mutex_;
+    std::unordered_map<std::string, GameAchievements> game_achievements_;
+    std::thread game_achievements_thread_;
+    std::atomic<bool> game_achievements_thread_running_{false};
+    // The highlighted game's achievements over the coverflow (X).
+    bool achievements_panel_open_ = false;
+
+    // "Achievement unlocked" notifications, shown one at a time over the
+    // game (and the guide) for a few seconds each.
+    void DrawAchievementToasts(ImGuiIO& io);
+    struct AchievementToast {
+      kernel::xam::AchievementNotification notification;
+      std::string texture_key;
+      std::vector<uint8_t> icon_rgba;
+      uint32_t icon_width = 0;
+      uint32_t icon_height = 0;
+    };
+    std::vector<AchievementToast> achievement_toasts_;
+    // When the first in achievement_toasts_ started showing.
+    std::chrono::steady_clock::time_point achievement_toast_start_;
+    uint32_t achievement_toast_count_ = 0;
 
     // Status line shown under the tab strip regardless of which tab is
     // active - "Playing: X", a play_media failure, a games_path scan

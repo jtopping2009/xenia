@@ -1075,6 +1075,9 @@ void EmulatorWindow::GuideMenuOverlay::OnDraw(ImGuiIO& io) {
     input_release_wait_ = true;
   }
 
+  // Over everything, whether or not the guide is open.
+  DrawAchievementToasts(io);
+
   bool guide_down = (buttons & hid::X_INPUT_GAMEPAD_GUIDE) != 0;
   if (guide_down && !guide_was_down_ && !dashboard_mode) {
     is_open_ = !is_open_;
@@ -1161,6 +1164,7 @@ void EmulatorWindow::GuideMenuOverlay::OnDraw(ImGuiIO& io) {
   bool coverflow = dashboard_mode && is_games_tab && !games_list_.empty();
   if (!coverflow) {
     letter_picker_open_ = false;
+    achievements_panel_open_ = false;
   }
   if (input_release_wait_) {
     if (buttons || left_trigger_down || right_trigger_down) {
@@ -1215,6 +1219,26 @@ void EmulatorWindow::GuideMenuOverlay::OnDraw(ImGuiIO& io) {
     } else if (close_pressed || y_pressed) {
       letter_picker_open_ = false;
     }
+  } else if (achievements_panel_open_) {
+    // The highlighted game's achievements: up/down scroll, B or X closes.
+    const GameAchievements* achievements = FindGameAchievements(
+        games_list_[std::clamp(games_selected_index_, 0,
+                               int(games_list_.size()) - 1)]
+            .path);
+    int count = achievements ? int(achievements->list.size()) : 0;
+    if (count) {
+      if (up_pressed) {
+        achievements_selected_index_ =
+            (achievements_selected_index_ + count - 1) % count;
+      }
+      if (down_pressed) {
+        achievements_selected_index_ =
+            (achievements_selected_index_ + 1) % count;
+      }
+    }
+    if (close_pressed || play_pause_pressed) {
+      achievements_panel_open_ = false;
+    }
   } else {
     if (y_pressed && !dashboard_mode) {
       pending_action_ = PendingAction::kReturnToDashboard;
@@ -1224,6 +1248,16 @@ void EmulatorWindow::GuideMenuOverlay::OnDraw(ImGuiIO& io) {
         letter_picker_open_ = true;
         letter_picker_index_ = GameLetter(games_list_[std::clamp(
             games_selected_index_, 0, int(games_list_.size()) - 1)]);
+      }
+      if (play_pause_pressed) {
+        const GameAchievements* achievements = FindGameAchievements(
+            games_list_[std::clamp(games_selected_index_, 0,
+                                   int(games_list_.size()) - 1)]
+                .path);
+        if (achievements && !achievements->list.empty()) {
+          achievements_panel_open_ = true;
+          achievements_selected_index_ = 0;
+        }
       }
       if (previous_letter_pressed) {
         JumpGameLetter(-1);
@@ -1312,6 +1346,9 @@ void EmulatorWindow::GuideMenuOverlay::OnDraw(ImGuiIO& io) {
       step(games_selected_index_, int(games_list_.size()));
     } else if (is_home_tab) {
       step(home_selected_index_, int(BuildHomeRows().size()));
+    } else if (CurrentTab() == kAchievementsTab) {
+      step(achievements_selected_index_,
+           int(title_achievements_.list.size()));
     } else if (CurrentTab() == kSettingsTab) {
       std::vector<SettingRow> setting_rows = BuildSettingRows();
       if (settings_choosing_ && settings_selected_index_ <
@@ -1494,6 +1531,8 @@ void EmulatorWindow::GuideMenuOverlay::EnterSelectedTab() {
     EnterMusicBrowser();
   } else if (CurrentTab() == kGamesTab) {
     EnterGamesBrowser();
+  } else if (CurrentTab() == kAchievementsTab) {
+    LoadTitleAchievements();
   }
 }
 
@@ -1718,6 +1757,8 @@ void EmulatorWindow::GuideMenuOverlay::RebuildTabs(bool dashboard_mode) {
   if (!dashboard_mode) {
     tabs_.push_back(kHomeTab);
     tile_names_.push_back("Home");
+    tabs_.push_back(kAchievementsTab);
+    tile_names_.push_back("Achievements");
   }
   tabs_.push_back(kMusicTab);
   tile_names_.push_back("Music");
@@ -2101,6 +2142,13 @@ void EmulatorWindow::GuideMenuOverlay::DrawGuide(ImGuiIO& io) {
       }
       selected_row = games_selected_index_;
     } break;
+    case kAchievementsTab: {
+      // Drawn by DrawAchievementList rather than as rows.
+      LoadTitleAchievements();
+      if (title_achievements_.list.empty()) {
+        empty_message = "This game has no achievements.";
+      }
+    } break;
   }
 
   ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
@@ -2189,7 +2237,13 @@ void EmulatorWindow::GuideMenuOverlay::DrawGuide(ImGuiIO& io) {
     const float row_height = 64.0f * s;
     const float title_size = 32.0f * s;
     const float value_size = 25.0f * s;
-    if (rows.empty()) {
+    if (CurrentTab() == kAchievementsTab &&
+        !title_achievements_.list.empty()) {
+      DrawAchievementList(dl, font, s, list_x0, top, list_x1, bottom,
+                          title_achievements_,
+                          AchievementProgressFor(title_achievements_.title_id),
+                          achievements_selected_index_, true);
+    } else if (rows.empty()) {
       dl->AddText(font, 26.0f * s,
                   ImVec2(list_x0 + 24.0f * s, top + 20.0f * s),
                   IM_COL32(90, 90, 90, 255), empty_message.c_str(), nullptr,
@@ -2985,6 +3039,13 @@ void EmulatorWindow::GuideMenuOverlay::DrawDashboard(ImGuiIO& io) {
                   CurrentTab() == kGamesTab ? "Play" : "Select");
       if (coverflow) {
         draw_button(IM_COL32(220, 170, 20, 255), "Y", "Letters");
+        const GameAchievements* achievements = FindGameAchievements(
+            games_list_[std::clamp(games_selected_index_, 0,
+                                   int(games_list_.size()) - 1)]
+                .path);
+        if (achievements && !achievements->list.empty()) {
+          draw_button(IM_COL32(40, 110, 220, 255), "X", "Achievements");
+        }
       }
       if (CurrentTab() == kMusicTab && music_nav_stack_.size() > 1) {
         draw_button(IM_COL32(196, 36, 36, 255), "B", "Back");
@@ -3221,6 +3282,17 @@ void EmulatorWindow::GuideMenuOverlay::DrawDashboard(ImGuiIO& io) {
       }
       if (!line.empty()) {
         centered(18.0f * s, IM_COL32(190, 215, 180, 255), line);
+      }
+      // Achievements, once read from the game.
+      EnsureGameAchievementsLoading();
+      if (const GameAchievements* achievements =
+              FindGameAchievements(game.path)) {
+        if (!achievements->list.empty()) {
+          centered(18.0f * s, IM_COL32(250, 222, 120, 255),
+                   AchievementSummary(
+                       *achievements,
+                       AchievementProgressFor(achievements->title_id)));
+        }
       }
       // The description, as much as fits.
       if (art && art->matched && !art->info.overview.empty() &&
@@ -3542,6 +3614,49 @@ void EmulatorWindow::GuideMenuOverlay::DrawDashboard(ImGuiIO& io) {
                   "A  Jump      B  Back");
     }
 
+    // The highlighted game's achievements (X).
+    const GameAchievements* panel_achievements =
+        achievements_panel_open_ && coverflow
+            ? FindGameAchievements(
+                  games_list_[std::clamp(games_selected_index_, 0,
+                                         int(games_list_.size()) - 1)]
+                      .path)
+            : nullptr;
+    if (panel_achievements && !panel_achievements->list.empty()) {
+      dl->AddRectFilled(ImVec2(0.0f, 0.0f), io.DisplaySize,
+                        IM_COL32(0, 0, 0, 130));
+      float box_w = std::min(940.0f * s, width - 40.0f * s);
+      float box_h = std::min(600.0f * s, height - 40.0f * s);
+      ImVec2 b0(width * 0.5f - box_w * 0.5f, height * 0.5f - box_h * 0.5f);
+      ImVec2 b1(b0.x + box_w, b0.y + box_h);
+      dl->AddRectFilled(ImVec2(b0.x + 8.0f * s, b0.y + 8.0f * s),
+                        ImVec2(b1.x + 8.0f * s, b1.y + 8.0f * s),
+                        IM_COL32(0, 0, 0, 90), 14.0f * s);
+      dl->AddRectFilled(b0, b1, IM_COL32(28, 40, 24, 248), 14.0f * s);
+      dl->AddRect(b0, b1, IM_COL32(150, 230, 90, 200), 14.0f * s, 0,
+                  2.0f * s);
+      int selected_game = std::clamp(games_selected_index_, 0,
+                                     int(games_list_.size()) - 1);
+      const GameMetadata* metadata =
+          FindGameMetadata(games_list_[selected_game].path);
+      std::string title = metadata && !metadata->title.empty()
+                              ? metadata->title
+                              : games_list_[selected_game].title;
+      dl->PushClipRect(b0, b1, true);
+      AddShadowedText(dl, font, 28.0f * s,
+                      ImVec2(b0.x + 30.0f * s, b0.y + 20.0f * s),
+                      IM_COL32(255, 255, 255, 255), title + " Achievements");
+      dl->PopClipRect();
+      DrawAchievementList(
+          dl, font, s, b0.x + 20.0f * s, b0.y + 66.0f * s, b1.x - 20.0f * s,
+          b1.y - 56.0f * s, *panel_achievements,
+          AchievementProgressFor(panel_achievements->title_id),
+          achievements_selected_index_, false);
+      dl->AddText(font, 20.0f * s,
+                  ImVec2(b0.x + 30.0f * s, b1.y - 40.0f * s),
+                  IM_COL32(210, 230, 200, 255), "B  Back");
+    }
+
     // Turn-off confirmation (inside a shell), over everything.
     if (pending_action_ == PendingAction::kTurnOff) {
       dl->AddRectFilled(ImVec2(0.0f, 0.0f), io.DisplaySize,
@@ -3588,6 +3703,9 @@ EmulatorWindow::GuideMenuOverlay::~GuideMenuOverlay() {
   }
   if (game_art_thread_.joinable()) {
     game_art_thread_.join();
+  }
+  if (game_achievements_thread_.joinable()) {
+    game_achievements_thread_.join();
   }
   if (music_image_thread_.joinable()) {
     music_image_thread_.join();
@@ -3828,11 +3946,426 @@ EmulatorWindow::GuideMenuOverlay::FindGameArt(
   return it != game_art_.end() ? &it->second : nullptr;
 }
 
+void EmulatorWindow::GuideMenuOverlay::ReadGameAchievements(
+    const kernel::util::XdbfGameData& db, uint32_t title_id,
+    GameAchievements* out) {
+  *out = GameAchievements();
+  out->title_id = title_id;
+  // English where the game has it - the font can't draw every script.
+  out->list = kernel::xam::ReadAchievements(db, XLanguage::kEnglish);
+  out->icons.resize(out->list.size());
+  for (size_t i = 0; i < out->list.size(); ++i) {
+    kernel::util::XdbfBlock image =
+        db.GetEntry(kernel::util::XdbfSection::kImage, out->list[i].image_id);
+    if (image && image.size) {
+      GameAchievements::Icon& icon = out->icons[i];
+      DecodeImageRgba(image.buffer, image.size, &icon.rgba, &icon.width,
+                      &icon.height);
+    }
+  }
+}
+
+const kernel::xam::AchievementProgress&
+EmulatorWindow::GuideMenuOverlay::AchievementProgressFor(uint32_t title_id) {
+  auto it = achievement_progress_.find(title_id);
+  if (it == achievement_progress_.end()) {
+    kernel::xam::AchievementProgress progress;
+    kernel::xam::LoadAchievementProgress(
+        emulator_window_.emulator()->storage_root(), title_id, &progress);
+    it = achievement_progress_.emplace(title_id, std::move(progress)).first;
+  }
+  return it->second;
+}
+
+std::string EmulatorWindow::GuideMenuOverlay::AchievementSummary(
+    const GameAchievements& achievements,
+    const kernel::xam::AchievementProgress& progress) {
+  uint32_t unlocked = 0, unlocked_gamerscore = 0, total_gamerscore = 0;
+  for (const kernel::xam::AchievementInfo& info : achievements.list) {
+    total_gamerscore += info.gamerscore;
+    if (progress.Find(info.id)) {
+      ++unlocked;
+      unlocked_gamerscore += info.gamerscore;
+    }
+  }
+  return fmt::format("{} of {} achievements  \xC2\xB7  {} / {} G", unlocked,
+                     achievements.list.size(), unlocked_gamerscore,
+                     total_gamerscore);
+}
+
+void EmulatorWindow::GuideMenuOverlay::DrawAchievementList(
+    ImDrawList* dl, ImFont* font, float s, float x0, float y0, float x1,
+    float y1, const GameAchievements& achievements,
+    const kernel::xam::AchievementProgress& progress, int selected,
+    bool light) {
+  const ImVec2 p0(x0, y0);
+  const ImVec2 p1(x1, y1);
+  const ImU32 title_color =
+      light ? IM_COL32(45, 45, 45, 255) : IM_COL32(255, 255, 255, 255);
+  const ImU32 detail_color =
+      light ? IM_COL32(110, 110, 110, 255) : IM_COL32(200, 220, 190, 255);
+  const ImU32 locked_title_color =
+      light ? IM_COL32(130, 130, 130, 255) : IM_COL32(175, 185, 170, 255);
+  const ImU32 locked_detail_color =
+      light ? IM_COL32(160, 160, 160, 255) : IM_COL32(140, 155, 135, 255);
+  const ImU32 selected_color = IM_COL32(255, 255, 255, 255);
+  const ImU32 selected_detail_color = IM_COL32(225, 250, 215, 255);
+
+  // The summary along the top.
+  const float summary_size = 20.0f * s;
+  dl->AddText(font, summary_size, ImVec2(p0.x + 24.0f * s, p0.y + 10.0f * s),
+              light ? IM_COL32(90, 90, 90, 255) : IM_COL32(250, 222, 120, 255),
+              AchievementSummary(achievements, progress).c_str());
+  float list_y0 = p0.y + summary_size + 22.0f * s;
+
+  // Unlocked first, most recent first, then the rest in the game's order -
+  // like the console's own list.
+  std::vector<size_t> order;
+  for (size_t i = 0; i < achievements.list.size(); ++i) {
+    order.push_back(i);
+  }
+  std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+    const auto* unlock_a = progress.Find(achievements.list[a].id);
+    const auto* unlock_b = progress.Find(achievements.list[b].id);
+    if (!unlock_a || !unlock_b) {
+      return unlock_a && !unlock_b;
+    }
+    return unlock_a->time > unlock_b->time;
+  });
+
+  const float row_height = 74.0f * s;
+  int total = int(order.size());
+  if (!total) {
+    return;
+  }
+  selected = std::clamp(selected, 0, total - 1);
+  int max_visible = std::max(1, int((p1.y - list_y0) / row_height));
+  int first_visible = 0;
+  if (total > max_visible) {
+    first_visible =
+        std::clamp(selected - max_visible / 2, 0, total - max_visible);
+  }
+  int last_visible = std::min(total, first_visible + max_visible);
+  dl->PushClipRect(ImVec2(p0.x, list_y0), p1, true);
+  float y = list_y0;
+  for (int row = first_visible; row < last_visible; ++row) {
+    size_t i = order[row];
+    const kernel::xam::AchievementInfo& info = achievements.list[i];
+    const kernel::xam::AchievementProgress::Unlock* unlock =
+        progress.Find(info.id);
+    bool is_selected = row == selected;
+    ImVec2 r0(p0.x, y);
+    ImVec2 r1(p1.x, y + row_height);
+    if (is_selected) {
+      if (light) {
+        dl->AddRectFilledMultiColor(
+            r0, r1, IM_COL32(82, 184, 36, 255), IM_COL32(82, 184, 36, 255),
+            IM_COL32(42, 142, 20, 255), IM_COL32(42, 142, 20, 255));
+      } else {
+        dl->AddRectFilled(r0, r1, IM_COL32(110, 200, 50, 120), 8.0f * s);
+        dl->AddRect(r0, r1, IM_COL32(255, 255, 255, 200), 8.0f * s, 0,
+                    1.5f * s);
+      }
+    } else if (row + 1 < last_visible && row + 1 != selected) {
+      dl->AddLine(ImVec2(r0.x + 16.0f * s, r1.y),
+                  ImVec2(r1.x - 16.0f * s, r1.y),
+                  light ? IM_COL32(226, 226, 226, 255)
+                        : IM_COL32(255, 255, 255, 30),
+                  1.0f * s);
+    }
+
+    // The picture - dimmed while locked, hidden for a locked secret one.
+    float icon = row_height - 16.0f * s;
+    ImVec2 i0(r0.x + 12.0f * s, r0.y + 8.0f * s);
+    ImVec2 i1(i0.x + icon, i0.y + icon);
+    const GameAchievements::Icon& image = achievements.icons[i];
+    DashboardArt art;
+    art.key = fmt::format("achievement:{:08X}:{}", achievements.title_id,
+                          info.id);
+    art.rgba = &image.rgba;
+    art.width = image.width;
+    art.height = image.height;
+    void* texture = ArtTexture(art);
+    if (texture && (unlock || !info.secret())) {
+      dl->AddImage(texture, i0, i1, ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f),
+                   unlock ? IM_COL32(255, 255, 255, 255)
+                          : IM_COL32(120, 120, 120, 200));
+    } else {
+      dl->AddRectFilled(i0, i1,
+                        light ? IM_COL32(205, 205, 205, 255)
+                              : IM_COL32(255, 255, 255, 30),
+                        4.0f * s);
+      ImVec2 extent = font->CalcTextSizeA(30.0f * s, FLT_MAX, 0.0f, "?");
+      dl->AddText(font, 30.0f * s,
+                  ImVec2((i0.x + i1.x - extent.x) * 0.5f,
+                         (i0.y + i1.y - extent.y) * 0.5f),
+                  light ? IM_COL32(150, 150, 150, 255)
+                        : IM_COL32(255, 255, 255, 120),
+                  "?");
+    }
+
+    // Gamerscore, and when it was unlocked, on the right.
+    float text_x = i1.x + 16.0f * s;
+    float right_x = r1.x - 20.0f * s;
+    const float name_size = 22.0f * s;
+    const float detail_size = 17.0f * s;
+    std::string gamerscore = fmt::format("{} G", info.gamerscore);
+    ImVec2 gamerscore_extent =
+        font->CalcTextSizeA(name_size, FLT_MAX, 0.0f, gamerscore.c_str());
+    float value_x = right_x - gamerscore_extent.x;
+    std::string when;
+    ImVec2 when_extent(0.0f, 0.0f);
+    if (unlock) {
+      std::time_t time = std::time_t(unlock->time);
+      std::tm local = {};
+#if XE_PLATFORM_WIN32
+      localtime_s(&local, &time);
+#else
+      localtime_r(&time, &local);
+#endif
+      when = fmt::format("{}/{}/{}", local.tm_mon + 1, local.tm_mday,
+                         local.tm_year + 1900);
+      when_extent =
+          font->CalcTextSizeA(detail_size, FLT_MAX, 0.0f, when.c_str());
+      value_x = std::min(value_x, right_x - when_extent.x);
+    }
+    ImU32 name_color = is_selected ? selected_color
+                       : unlock    ? title_color
+                                   : locked_title_color;
+    ImU32 sub_color = is_selected ? selected_detail_color
+                      : unlock    ? detail_color
+                                  : locked_detail_color;
+    dl->AddText(font, name_size,
+                ImVec2(right_x - gamerscore_extent.x, r0.y + 12.0f * s),
+                name_color, gamerscore.c_str());
+    if (!when.empty()) {
+      dl->AddText(font, detail_size,
+                  ImVec2(right_x - when_extent.x, r0.y + 42.0f * s),
+                  sub_color, when.c_str());
+    }
+
+    // Name and description - a locked secret one shows neither.
+    std::string name = info.label;
+    std::string detail = info.description;
+    if (!unlock) {
+      if (info.secret()) {
+        name = "Secret Achievement";
+        detail = "Keep playing to unlock this secret achievement.";
+      } else if (!info.unachieved.empty()) {
+        detail = info.unachieved;
+      }
+    }
+    dl->PushClipRect(ImVec2(text_x, r0.y), ImVec2(value_x - 16.0f * s, r1.y),
+                     true);
+    dl->AddText(font, name_size, ImVec2(text_x, r0.y + 12.0f * s), name_color,
+                name.c_str());
+    dl->AddText(font, detail_size, ImVec2(text_x, r0.y + 42.0f * s),
+                sub_color, detail.c_str());
+    dl->PopClipRect();
+    y += row_height;
+  }
+  dl->PopClipRect();
+
+  // Scroll hints.
+  float arrow = 8.0f * s;
+  float ax = p1.x - 8.0f * s;
+  ImU32 arrow_color =
+      light ? IM_COL32(140, 140, 140, 255) : IM_COL32(220, 240, 210, 200);
+  if (last_visible < total) {
+    float ay = p1.y - 2.0f * s;
+    dl->AddTriangleFilled(ImVec2(ax - arrow, ay - arrow),
+                          ImVec2(ax + arrow, ay - arrow), ImVec2(ax, ay),
+                          arrow_color);
+  }
+  if (first_visible > 0) {
+    float ay = list_y0 - 4.0f * s;
+    dl->AddTriangleFilled(ImVec2(ax - arrow, ay), ImVec2(ax, ay - arrow),
+                          ImVec2(ax + arrow, ay), arrow_color);
+  }
+}
+
+void EmulatorWindow::GuideMenuOverlay::LoadTitleAchievements() {
+  Emulator* emulator = emulator_window_.emulator();
+  if (!emulator->is_title_open() || !emulator->kernel_state() ||
+      !emulator->kernel_state()->GetExecutableModule()) {
+    return;
+  }
+  uint32_t title_id = emulator->title_id();
+  if (title_achievements_loaded_ && title_achievements_.title_id == title_id) {
+    return;
+  }
+  title_achievements_loaded_ = true;
+  achievements_selected_index_ = 0;
+  ReadGameAchievements(emulator->kernel_state()->title_xdbf(), title_id,
+                       &title_achievements_);
+}
+
+void EmulatorWindow::GuideMenuOverlay::EnsureGameAchievementsLoading() {
+  if (game_achievements_thread_running_ || games_list_.empty()) {
+    return;
+  }
+  // Just the highlighted game, once its title ID is known.
+  const GameEntry& game = games_list_[std::clamp(
+      games_selected_index_, 0, int(games_list_.size()) - 1)];
+  std::string key = xe::path_to_utf8(game.path);
+  {
+    std::lock_guard<std::mutex> lock(game_achievements_mutex_);
+    if (game_achievements_.count(key)) {
+      return;
+    }
+  }
+  const GameMetadata* metadata = FindGameMetadata(game.path);
+  if (!metadata || !metadata->title_id) {
+    return;
+  }
+  if (game_achievements_thread_.joinable()) {
+    game_achievements_thread_.join();  // Already finished its last game.
+  }
+  std::filesystem::path cache_dir =
+      emulator_window_.emulator()->cache_root() / "dashboard";
+  game_achievements_thread_running_ = true;
+  game_achievements_thread_ = std::thread([this, path = game.path, key,
+                                           title_id = metadata->title_id,
+                                           cache_dir] {
+    xe::threading::set_name("Dashboard Achievements");
+    GameAchievements achievements;
+    achievements.title_id = title_id;
+    std::vector<uint8_t> xdbf;
+    if (!game_metadata_stop_ && LoadGameXdbfCached(path, cache_dir, &xdbf)) {
+      ReadGameAchievements(
+          kernel::util::XdbfGameData(xdbf.data(), xdbf.size()), title_id,
+          &achievements);
+    }
+    {
+      std::lock_guard<std::mutex> lock(game_achievements_mutex_);
+      game_achievements_.emplace(key, std::move(achievements));
+    }
+    game_achievements_thread_running_ = false;
+  });
+}
+
+const EmulatorWindow::GuideMenuOverlay::GameAchievements*
+EmulatorWindow::GuideMenuOverlay::FindGameAchievements(
+    const std::filesystem::path& path) {
+  std::lock_guard<std::mutex> lock(game_achievements_mutex_);
+  auto it = game_achievements_.find(xe::path_to_utf8(path));
+  return it != game_achievements_.end() ? &it->second : nullptr;
+}
+
+void EmulatorWindow::GuideMenuOverlay::DrawAchievementToasts(ImGuiIO& io) {
+  auto now = std::chrono::steady_clock::now();
+  for (kernel::xam::AchievementNotification& notification :
+       kernel::xam::TakeAchievementNotifications()) {
+    AchievementToast toast;
+    toast.texture_key =
+        fmt::format("achievement_toast:{}", achievement_toast_count_++);
+    if (!notification.icon_png.empty()) {
+      DecodeImageRgba(notification.icon_png.data(),
+                      notification.icon_png.size(), &toast.icon_rgba,
+                      &toast.icon_width, &toast.icon_height);
+    }
+    toast.notification = std::move(notification);
+    if (achievement_toasts_.empty()) {
+      achievement_toast_start_ = now;
+    }
+    achievement_toasts_.push_back(std::move(toast));
+  }
+  if (achievement_toasts_.empty()) {
+    return;
+  }
+
+  // Each slides up, stays a few seconds, then fades before the next.
+  constexpr float kShowSeconds = 5.0f;
+  constexpr float kInSeconds = 0.35f;
+  constexpr float kOutSeconds = 0.5f;
+  float shown_for =
+      std::chrono::duration<float>(now - achievement_toast_start_).count();
+  if (shown_for >= kShowSeconds) {
+    achievement_toasts_.erase(achievement_toasts_.begin());
+    achievement_toast_start_ = now;
+    if (achievement_toasts_.empty()) {
+      return;
+    }
+    shown_for = 0.0f;
+  }
+  AchievementToast& toast = achievement_toasts_.front();
+  float in = std::clamp(shown_for / kInSeconds, 0.0f, 1.0f);
+  float out = std::clamp((kShowSeconds - shown_for) / kOutSeconds, 0.0f, 1.0f);
+  float alpha = std::min(in, out);
+  // Eased in.
+  float slide = 1.0f - (1.0f - in) * (1.0f - in);
+
+  ImFont* font = emulator_window_.imgui_drawer()->ui_font();
+  if (!font) {
+    font = ImGui::GetFont();
+  }
+  const float s =
+      std::min(io.DisplaySize.x / 1280.0f, io.DisplaySize.y / 720.0f);
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  auto faded = [alpha](int r, int g, int b, int a) {
+    return IM_COL32(r, g, b, int(float(a) * alpha));
+  };
+
+  std::string heading = "Achievement unlocked";
+  std::string body = fmt::format("{}G - {}", toast.notification.gamerscore,
+                                 toast.notification.label);
+  const float heading_size = 18.0f * s;
+  const float body_size = 24.0f * s;
+  const float height = 84.0f * s;
+  const float icon = height - 20.0f * s;
+  const float radius = height * 0.5f;
+  float text_width = std::max(
+      font->CalcTextSizeA(heading_size, FLT_MAX, 0.0f, heading.c_str()).x,
+      font->CalcTextSizeA(body_size, FLT_MAX, 0.0f, body.c_str()).x);
+  float width = std::min(radius * 2.0f + 8.0f * s + text_width + radius,
+                         io.DisplaySize.x - 80.0f * s);
+  float x0 = (io.DisplaySize.x - width) * 0.5f;
+  float y0 =
+      io.DisplaySize.y - height - 46.0f * s + (1.0f - slide) * 30.0f * s;
+  ImVec2 p0(x0, y0);
+  ImVec2 p1(x0 + width, y0 + height);
+  dl->AddRectFilled(ImVec2(p0.x + 4.0f * s, p0.y + 6.0f * s),
+                    ImVec2(p1.x + 4.0f * s, p1.y + 6.0f * s),
+                    faded(0, 0, 0, 90), radius);
+  dl->AddRectFilled(p0, p1, faded(40, 40, 44, 240), radius);
+  dl->AddRect(p0, p1, faded(110, 200, 50, 255), radius, 0, 2.5f * s);
+
+  // The achievement's picture, in a circle like the console's.
+  ImVec2 center(p0.x + radius, p0.y + radius);
+  DashboardArt art;
+  art.key = toast.texture_key;
+  art.rgba = &toast.icon_rgba;
+  art.width = toast.icon_width;
+  art.height = toast.icon_height;
+  if (void* texture = ArtTexture(art)) {
+    dl->AddImageRounded(texture,
+                        ImVec2(center.x - icon * 0.5f, center.y - icon * 0.5f),
+                        ImVec2(center.x + icon * 0.5f, center.y + icon * 0.5f),
+                        ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f),
+                        faded(255, 255, 255, 255), icon * 0.5f);
+  } else {
+    dl->AddCircleFilled(center, icon * 0.5f, faded(110, 200, 50, 255), 32);
+  }
+  dl->AddCircle(center, icon * 0.5f + 1.5f * s, faded(255, 255, 255, 160), 32,
+                2.0f * s);
+
+  float text_x = p0.x + radius * 2.0f + 8.0f * s;
+  dl->PushClipRect(ImVec2(text_x, p0.y), ImVec2(p1.x - radius * 0.5f, p1.y),
+                   true);
+  dl->AddText(font, heading_size, ImVec2(text_x, p0.y + 14.0f * s),
+              faded(170, 230, 120, 255), heading.c_str());
+  dl->AddText(font, body_size, ImVec2(text_x, p0.y + 38.0f * s),
+              faded(255, 255, 255, 255), body.c_str());
+  dl->PopClipRect();
+}
+
 void EmulatorWindow::GuideMenuOverlay::ResetBrowsingState() {
   music_nav_stack_.clear();
   games_list_.clear();
   games_list_loaded_ = false;
   letter_picker_open_ = false;
+  achievements_panel_open_ = false;
+  achievement_progress_.clear();
 }
 
 void EmulatorWindow::GuideMenuOverlay::StartLeaveInPlace() {

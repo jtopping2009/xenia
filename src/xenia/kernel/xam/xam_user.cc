@@ -12,8 +12,10 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/string_util.h"
+#include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xam/achievements.h"
 #include "xenia/kernel/xam/user_profile.h"
 #include "xenia/kernel/xam/xam_private.h"
 #include "xenia/kernel/xenumerator.h"
@@ -691,22 +693,26 @@ dword_result_t XamUserCreateAchievementEnumerator_entry(
   const util::XdbfGameData db = kernel_state()->title_xdbf();
 
   if (db.is_valid()) {
-    const XLanguage language =
-        db.GetExistingLanguage(static_cast<XLanguage>(cvars::user_language));
-    const std::vector<util::XdbfAchievementTableEntry> achievement_list =
-        db.GetAchievements();
-
-    for (const util::XdbfAchievementTableEntry& entry : achievement_list) {
+    // With what's been unlocked (see achievements.h).
+    AchievementProgress progress;
+    LoadAchievementProgress(kernel_state()->emulator()->storage_root(),
+                            kernel_state()->emulator()->title_id(), &progress);
+    for (const AchievementInfo& info : ReadAchievements(
+             db, static_cast<XLanguage>(cvars::user_language))) {
       auto item = XStaticAchievementEnumerator::AchievementDetails{
-          entry.id,
-          xe::to_utf16(db.GetStringTableEntry(language, entry.label_id)),
-          xe::to_utf16(db.GetStringTableEntry(language, entry.description_id)),
-          xe::to_utf16(db.GetStringTableEntry(language, entry.unachieved_id)),
-          entry.image_id,
-          entry.gamerscore,
+          info.id,
+          xe::to_utf16(info.label),
+          xe::to_utf16(info.description),
+          xe::to_utf16(info.unachieved),
+          info.image_id,
+          info.gamerscore,
           {0, 0},
-          entry.flags};
-
+          info.flags};
+      if (const AchievementProgress::Unlock* unlock = progress.Find(info.id)) {
+        item.flags |= kAchievementAchieved;
+        UnixTimeToGuestFileTime(unlock->time, &item.unlock_time.unk_0,
+                                &item.unlock_time.unk_4);
+      }
       e->AppendItem(item);
     }
   }

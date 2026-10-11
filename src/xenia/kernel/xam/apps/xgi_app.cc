@@ -11,6 +11,7 @@
 
 #include "xenia/base/logging.h"
 #include "xenia/base/threading.h"
+#include "xenia/kernel/xam/achievements.h"
 
 namespace xe {
 namespace kernel {
@@ -55,6 +56,16 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t achievements_ptr = xe::load_and_swap<uint32_t>(buffer + 4);
       XELOGD("XGIUserWriteAchievements({:08X}, {:08X})", achievement_count,
              achievements_ptr);
+      // An XUSER_ACHIEVEMENT (user index, achievement id) each.
+      std::vector<uint32_t> ids;
+      if (achievements_ptr && achievement_count <= 0x1000) {
+        auto achievements = memory_->TranslateVirtual(achievements_ptr);
+        for (uint32_t i = 0; i < achievement_count; ++i) {
+          ids.push_back(
+              xe::load_and_swap<uint32_t>(achievements + i * 8 + 4));
+        }
+      }
+      UnlockAchievements(kernel_state_, ids);
       return X_E_SUCCESS;
     }
     case 0x000B0010: {

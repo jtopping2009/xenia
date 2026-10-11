@@ -47,6 +47,13 @@ bool LoadGameMetadataCached(const std::filesystem::path& game_path,
                             const std::filesystem::path& cache_dir,
                             GameMetadata* out);
 
+// The game's XDBF resource (its achievements, their pictures and so on),
+// cached under `cache_dir` like LoadGameMetadataCached - reading the game
+// the first time, so off the UI thread. False if it has none.
+bool LoadGameXdbfCached(const std::filesystem::path& game_path,
+                        const std::filesystem::path& cache_dir,
+                        std::vector<uint8_t>* out);
+
 // A game's entry in the LaunchBox Games Database
 // (https://gamesdb.launchbox-app.com/), for the dashboard's box art: its
 // pictures (file names on images.launchbox-app.com, empty when it has none)
