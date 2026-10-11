@@ -10,9 +10,11 @@
 #ifndef XENIA_CPU_PROCESSOR_H_
 #define XENIA_CPU_PROCESSOR_H_
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "xenia/base/cvar.h"
@@ -203,6 +205,13 @@ class Processor {
  private:
   // Synchronously demands a debug listener.
   void DemandDebugListener();
+
+  // Logs where every guest thread is (each frame's guest pc and function) -
+  // the --log_thread_stacks_interval sampler, for finding where a hung title
+  // is stuck.
+  void LogThreadStacks();
+  std::unique_ptr<std::thread> stack_sampler_;
+  std::atomic<bool> stack_sampler_stop_{false};
 
   // Suspends all known threads (except the caller).
   bool SuspendAllThreads();

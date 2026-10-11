@@ -189,9 +189,20 @@ class UserProfile {
     BinarySetting(uint32_t setting_id, const std::vector<uint8_t>& value)
         : Setting(setting_id, Type::BINARY, 8, true), value(value) {}
     std::vector<uint8_t> value;
+    // The most a setting can hold, from its id - the size the title sizes its
+    // buffers by. Larger values (a title writing more than that, or a profile
+    // saved before this limit) are cut to it, as on the console.
+    size_t max_size() const {
+      Key key;
+      key.value = setting_id;
+      return key.size;
+    }
     void Append(X_USER_PROFILE_SETTING_DATA* data,
                 SettingByteStream* stream) override {
       Setting::Append(data, stream);
+      if (value.size() > max_size()) {
+        value.resize(max_size());
+      }
       if (value.empty()) {
         data->binary.size = 0;
         data->binary.ptr = 0;
@@ -207,6 +218,9 @@ class UserProfile {
       return std::vector<uint8_t>(value.data(), value.data() + value.size());
     }
     void Deserialize(std::vector<uint8_t> data) override {
+      if (data.size() > max_size()) {
+        data.resize(max_size());
+      }
       value = data;
       is_set = true;
     }

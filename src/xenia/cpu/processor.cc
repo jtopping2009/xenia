@@ -9,6 +9,8 @@
 
 #include "xenia/cpu/processor.h"
 
+#include <chrono>
+
 #include "xenia/base/assert.h"
 #include "xenia/base/atomic.h"
 #include "xenia/base/byte_order.h"
@@ -46,6 +48,11 @@ DEFINE_bool(debug, DEFAULT_DEBUG_FLAG,
             "Allow debugging and retain debug information.", "General");
 DEFINE_path(trace_function_data_path, "", "File to write trace data to.",
             "CPU");
+DEFINE_int32(log_thread_stacks_interval, 0,
+             "Every this many seconds, log where each guest thread is (its "
+             "call stack's guest addresses) - for finding where a title that "
+             "hangs is stuck. 0 to not.",
+             "CPU");
 DEFINE_bool(break_on_start, false, "Break into the debugger on startup.",
             "CPU");
 
@@ -86,6 +93,11 @@ Processor::Processor(xe::Memory* memory, ExportResolver* export_resolver)
     : memory_(memory), export_resolver_(export_resolver) {}
 
 Processor::~Processor() {
+  if (stack_sampler_) {
+    stack_sampler_stop_ = true;
+    stack_sampler_->join();
+    stack_sampler_.reset();
+  }
   {
     auto global_lock = global_critical_region_.Acquire();
     modules_.clear();
@@ -138,6 +150,20 @@ bool Processor::Setup(std::unique_ptr<backend::Backend> backend) {
   cpu::backend::CodeCache* code_cache = backend_->code_cache();
   if (code_cache) {
     stack_walker_ = StackWalker::Create(code_cache);
+  }
+  if (stack_walker_ && cvars::log_thread_stacks_interval > 0) {
+    stack_sampler_ = std::make_unique<std::thread>([this]() {
+      auto interval = std::chrono::seconds(cvars::log_thread_stacks_interval);
+      auto next = std::chrono::steady_clock::now() + interval;
+      while (!stack_sampler_stop_) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (std::chrono::steady_clock::now() < next) {
+          continue;
+        }
+        next += interval;
+        LogThreadStacks();
+      }
+    });
   }
   if (!stack_walker_) {
     // TODO(benvanik): disable features.
@@ -870,6 +896,41 @@ void Processor::UpdateThreadExecutionStates(
       }
     }
   }
+}
+
+void Processor::LogThreadStacks() {
+  // Gathered with the threads suspended and logged once they're running again:
+  // a suspended thread may hold the log's lock.
+  std::string text;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    if (execution_state_ != ExecutionState::kRunning) {
+      return;
+    }
+    SuspendAllThreads();
+    UpdateThreadExecutionStates();
+    for (auto& it : thread_debug_infos_) {
+      auto thread_info = it.second.get();
+      if (!thread_info->thread || !thread_info->suspended) {
+        continue;
+      }
+      text += fmt::format("\n  thread {:X} ({:08X}):", thread_info->thread_id,
+                          thread_info->thread_handle);
+      int shown = 0;
+      for (const auto& frame : thread_info->frames) {
+        if (!frame.guest_pc) {
+          continue;
+        }
+        text += fmt::format(" {:08X}[{:08X}]", frame.guest_pc,
+                            frame.guest_function_address);
+        if (++shown == 12) {
+          break;
+        }
+      }
+    }
+    ResumeAllThreads();
+  }
+  XELOGI("Thread stacks (pc[function], innermost first):{}", text);
 }
 
 void Processor::SuspendAllBreakpoints() {

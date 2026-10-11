@@ -8,12 +8,17 @@
  */
 
 #include "xenia/base/logging.h"
+#include "xenia/base/platform.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/xbox.h"
+
+#if XE_PLATFORM_WIN32
+#include "xenia/base/platform_win.h"
+#endif
 
 DEFINE_int32(user_language, 1,
              "User language ID.\n"
@@ -40,6 +45,64 @@ DEFINE_int32(user_country, 103,
 namespace xe {
 namespace kernel {
 namespace xboxkrnl {
+
+// The console's time zone settings, from the host's. Zeros (no time zone at
+// all) can send titles working out local time into an endless loop - MLB 2K12
+// hangs after loading the profile - so these are the PC's real ones.
+// Biases are minutes (UTC = local + bias); a date is the month, which
+// occurrence of the weekday in it (5 = last), the weekday and the hour.
+static void GetTimeZoneSetting(uint16_t setting, uint8_t value[4]) {
+  std::memset(value, 0, 4);
+#if XE_PLATFORM_WIN32
+  TIME_ZONE_INFORMATION info;
+  if (GetTimeZoneInformation(&info) == TIME_ZONE_ID_INVALID) {
+    return;
+  }
+  auto date = [value](const SYSTEMTIME& time) {
+    value[0] = uint8_t(time.wMonth);
+    value[1] = uint8_t(time.wDay);
+    value[2] = uint8_t(time.wDayOfWeek);
+    value[3] = uint8_t(time.wHour);
+  };
+  auto name = [value](const WCHAR* text) {
+    // Four characters: an abbreviation from the name's initials ("Eastern
+    // Standard Time" -> "EST").
+    int length = 0;
+    bool word_start = true;
+    for (const WCHAR* c = text; *c && length < 4; ++c) {
+      if (*c == L' ') {
+        word_start = true;
+      } else if (word_start) {
+        value[length++] = uint8_t(*c < 0x80 ? *c : '?');
+        word_start = false;
+      }
+    }
+  };
+  switch (setting) {
+    case 0x0001:
+      xe::store_and_swap<int32_t>(value, int32_t(info.Bias));
+      break;
+    case 0x0002:
+      name(info.StandardName);
+      break;
+    case 0x0003:
+      name(info.DaylightName);
+      break;
+    case 0x0004:
+      date(info.StandardDate);
+      break;
+    case 0x0005:
+      date(info.DaylightDate);
+      break;
+    case 0x0006:
+      xe::store_and_swap<int32_t>(value, int32_t(info.StandardBias));
+      break;
+    case 0x0007:
+      xe::store_and_swap<int32_t>(value, int32_t(info.DaylightBias));
+      break;
+  }
+#endif  // XE_PLATFORM_WIN32
+}
 
 X_STATUS xeExGetXConfigSetting(uint16_t category, uint16_t setting,
                                void* buffer, uint16_t buffer_size,
@@ -74,8 +137,7 @@ X_STATUS xeExGetXConfigSetting(uint16_t category, uint16_t setting,
         case 0x0006:  // XCONFIG_USER_TIME_ZONE_STD_BIAS
         case 0x0007:  // XCONFIG_USER_TIME_ZONE_DLT_BIAS
           setting_size = 4;
-          // TODO(benvanik): get this value.
-          xe::store_and_swap<uint32_t>(value, 0);
+          GetTimeZoneSetting(setting, value);
           break;
         case 0x0009:  // XCONFIG_USER_LANGUAGE
           setting_size = 4;

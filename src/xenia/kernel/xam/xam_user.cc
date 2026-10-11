@@ -361,6 +361,20 @@ dword_result_t XamUserWriteProfileSettings_entry(
         uint8_t* binary_ptr =
             kernel_state()->memory()->TranslateVirtual(setting.data.binary.ptr);
         size_t binary_size = setting.data.binary.size;
+        // A setting holds no more than its id says (1000 bytes for the title
+        // specific ones); titles size their reads by that, so keeping more
+        // would overrun their buffers when it's read back. MLB 2K12 writes
+        // 1024 bytes to XPROFILE_TITLE_SPECIFIC1.
+        UserProfile::Setting::Key key;
+        key.value = setting.setting_id;
+        if (binary_size > key.size) {
+          XELOGW(
+              "XamUserWriteProfileSettings: {:08X} is {} bytes, more than its "
+              "{} - keeping the first {}",
+              (uint32_t)setting.setting_id, binary_size, (uint32_t)key.size,
+              (uint32_t)key.size);
+          binary_size = key.size;
+        }
         std::vector<uint8_t> bytes;
         if (setting.data.binary.ptr) {
           // Copy provided data

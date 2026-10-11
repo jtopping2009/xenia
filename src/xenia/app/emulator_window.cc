@@ -3628,16 +3628,17 @@ void EmulatorWindow::StopMusicForExit() {
 
 void EmulatorWindow::QuitXenia() {
   StopMusicForExit();
-  config::SaveConfig();
+  // The config isn't saved here: settings changed in the guide are saved as
+  // they change, and saving everything again on the way out would undo any
+  // edits made to the config file while Xenia was running.
   XELOGI("QuitXenia: exiting");
   std::quick_exit(EXIT_SUCCESS);
 }
 
 void EmulatorWindow::RelaunchXenia(const std::filesystem::path& target) {
 #if XE_PLATFORM_WIN32
-  // The new process reads the config on startup - write out anything changed
-  // this session (resolution scale etc.) first, as a normal exit would.
-  config::SaveConfig();
+  // The config isn't saved first (see QuitXenia) - the guide's settings are
+  // already saved, and the new process reads the file as it is.
 
   std::wstring command_line =
       L"\"" + xe::filesystem::GetExecutablePath().wstring() + L"\"";

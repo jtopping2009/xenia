@@ -26,9 +26,13 @@
 #include "xenia/base/mapped_memory.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/string.h"
+#include "xenia/base/string_buffer.h"
 #include "xenia/cpu/backend/code_cache.h"
 #include "xenia/cpu/backend/null_backend.h"
 #include "xenia/cpu/cpu_flags.h"
+#include "xenia/cpu/function.h"
+#include "xenia/cpu/ppc/ppc_context.h"
+#include "xenia/cpu/ppc/ppc_opcode_info.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_driver.h"
@@ -59,6 +63,12 @@ DECLARE_int32(user_language);
 
 DEFINE_double(time_scalar, 1.0,
               "Scalar used to speed or slow time (1x, 2x, 1/2x, etc).",
+              "General");
+DEFINE_string(guest_date, "",
+              "Date the console's clock starts at (YYYY-MM-DD) instead of "
+              "today, for games that go wrong on today's date - sports games "
+              "whose seasons follow the calendar. Best set in a game's own "
+              "config (config\\<title id>.config.toml). Empty for today.",
               "General");
 DEFINE_string(
     launch_module, "",
@@ -565,6 +575,152 @@ void Emulator::LaunchNextTitle() {
   CompleteLaunch("", next_title);
 }
 
+// Starts the console's clock at --guest_date (set in a game's own config, as
+// it's read after that loads), for titles that go wrong on today's date: MLB
+// 2K12's season follows the real calendar and, a decade past its last
+// schedule, hangs after loading the profile looking for today's games.
+static void ApplyGuestDate() {
+  if (cvars::guest_date.empty()) {
+    return;
+  }
+  int year = 0, month = 0, day = 0;
+  if (std::sscanf(cvars::guest_date.c_str(), "%d-%d-%d", &year, &month,
+                  &day) != 3 ||
+      year < 1601 || month < 1 || month > 12 || day < 1 || day > 31) {
+    XELOGE("guest_date \"{}\" isn't a YYYY-MM-DD date", cvars::guest_date);
+    return;
+  }
+  // Days since 1601-01-01 (the FILETIME epoch), by the proleptic Gregorian
+  // calendar.
+  auto days_from_civil = [](int y, int m, int d) -> int64_t {
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    int64_t yoe = y - era * 400;
+    int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe;
+  };
+  int64_t days = days_from_civil(year, month, day) -
+                 days_from_civil(1601, 1, 1);
+  // Midday UTC, so it's the same date in every time zone.
+  uint64_t filetime = uint64_t(days * 86400 + 12 * 3600) * 10000000ull;
+  Clock::set_guest_system_time_base(filetime);
+  XELOGI("Console clock starts at {} (guest_date)", cvars::guest_date);
+}
+
+// Whether the guest can read [address, address + size) - so the crash dump
+// never faults itself reading a bad pointer.
+static bool GuestReadable(Memory* memory, uint32_t address, uint32_t size) {
+  if (!address || address + size < address) {
+    return false;
+  }
+  auto heap = memory->LookupHeap(address);
+  if (!heap || heap != memory->LookupHeap(address + size - 1)) {
+    return false;
+  }
+  uint32_t protect = 0;
+  return heap->QueryProtect(address, &protect) &&
+         (protect & kMemoryProtectRead) &&
+         heap->QueryProtect(address + size - 1, &protect) &&
+         (protect & kMemoryProtectRead);
+}
+
+// The rest of a crash dump beyond the registers: what was accessed, the code
+// around the crash, the link and count registers' targets, the memory the
+// registers point at, and the stack - enough to see what the game was doing.
+static void DumpCrashContext(Memory* memory, Exception* ex,
+                             cpu::GuestFunction* function,
+                             cpu::ppc::PPCContext* context) {
+  if (ex->code() == Exception::Code::kAccessViolation) {
+    uint64_t fault = ex->fault_address();
+    auto membase = reinterpret_cast<uint64_t>(memory->virtual_membase());
+    if (fault >= membase && fault < membase + 0x100000000ull) {
+      XELOGE("Fault: {} guest 0x{:08X}",
+             ex->access_violation_operation() ==
+                     Exception::AccessViolationOperation::kWrite
+                 ? "write to"
+                 : "read from",
+             uint32_t(fault - membase));
+    } else {
+      XELOGE("Fault: host address 0x{:016X}", fault);
+    }
+  } else {
+    XELOGE("Exception: illegal instruction");
+  }
+  XELOGE(" lr   = {:016X}", context->lr);
+  XELOGE(" ctr  = {:016X}", context->ctr);
+  XELOGE("Function: 0x{:08X}-0x{:08X}", function->address(),
+         function->end_address());
+
+  uint32_t pc = function->MapMachineCodeToGuestAddress(ex->pc());
+  auto disassemble = [memory](const char* title, uint32_t start,
+                              uint32_t end, uint32_t mark) {
+    XELOGE("{}:", title);
+    for (uint32_t address = start; address < end; address += 4) {
+      if (!GuestReadable(memory, address, 4)) {
+        break;
+      }
+      uint32_t code = xe::load_and_swap<uint32_t>(
+          memory->TranslateVirtual(address));
+      StringBuffer text;
+      cpu::ppc::DisasmPPC(address, code, &text);
+      XELOGE("{} {:08X} {:08X}  {}", address == mark ? ">" : " ", address,
+             code, text.to_string_view());
+    }
+  };
+  uint32_t from = std::max(function->address(), pc - 0x60);
+  disassemble("Code", from, pc + 0x20, pc);
+  if (uint32_t(context->lr) != 0 && uint32_t(context->lr) != pc) {
+    uint32_t lr = uint32_t(context->lr);
+    disassemble("Code at lr", lr - 0x20, lr + 0x10, lr);
+  }
+
+  // What the registers point at, where that's readable memory.
+  for (int i = 0; i < 32; i++) {
+    uint32_t address = uint32_t(context->r[i]);
+    if (i == 1 || address < 0x10000 || !GuestReadable(memory, address, 32)) {
+      continue;
+    }
+    auto p = memory->TranslateVirtual<uint8_t*>(address);
+    XELOGE(" [r{}] {:08X}: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
+           "{:08X}",
+           i, address, xe::load_and_swap<uint32_t>(p),
+           xe::load_and_swap<uint32_t>(p + 4),
+           xe::load_and_swap<uint32_t>(p + 8),
+           xe::load_and_swap<uint32_t>(p + 12),
+           xe::load_and_swap<uint32_t>(p + 16),
+           xe::load_and_swap<uint32_t>(p + 20),
+           xe::load_and_swap<uint32_t>(p + 24),
+           xe::load_and_swap<uint32_t>(p + 28));
+  }
+
+  // The stack, and the return addresses in the back chain (each frame's saved
+  // lr is 8 bytes below the next frame's start).
+  uint32_t sp = uint32_t(context->r[1]);
+  if (GuestReadable(memory, sp, 0x100)) {
+    auto p = memory->TranslateVirtual<uint8_t*>(sp);
+    for (uint32_t i = 0; i < 0x100; i += 16) {
+      XELOGE(" stack+{:02X}: {:08X} {:08X} {:08X} {:08X}", i,
+             xe::load_and_swap<uint32_t>(p + i),
+             xe::load_and_swap<uint32_t>(p + i + 4),
+             xe::load_and_swap<uint32_t>(p + i + 8),
+             xe::load_and_swap<uint32_t>(p + i + 12));
+    }
+  }
+  std::string backtrace;
+  for (int depth = 0; depth < 16 && GuestReadable(memory, sp, 4); depth++) {
+    uint32_t next = xe::load_and_swap<uint32_t>(memory->TranslateVirtual(sp));
+    if (next <= sp || !GuestReadable(memory, next - 8, 4)) {
+      break;
+    }
+    backtrace += fmt::format(
+        " {:08X}",
+        xe::load_and_swap<uint32_t>(memory->TranslateVirtual(next - 8)));
+    sp = next;
+  }
+  XELOGE("Backtrace:{}", backtrace);
+}
+
 bool Emulator::ExceptionCallbackThunk(Exception* ex, void* data) {
   return reinterpret_cast<Emulator*>(data)->ExceptionCallback(ex);
 }
@@ -612,6 +768,7 @@ bool Emulator::ExceptionCallback(Exception* ex) {
   for (int i = 0; i < 32; i++) {
     XELOGE(" r{:<3} = {:016X}", i, context->r[i]);
   }
+  DumpCrashContext(memory(), ex, guest_function, context);
   for (int i = 0; i < 32; i++) {
     XELOGE(" f{:<3} = {:016X} = (double){} = (float){}", i,
            *reinterpret_cast<uint64_t*>(&context->f[i]), context->f[i],
@@ -811,6 +968,7 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
     // Load the per-game configuration file and make sure updates are handled by
     // the callbacks.
     config::LoadGameConfig(title_id);
+    ApplyGuestDate();
     assert_true(game_config_load_callback_loop_next_index_ == SIZE_MAX);
     game_config_load_callback_loop_next_index_ = 0;
     while (game_config_load_callback_loop_next_index_ <
