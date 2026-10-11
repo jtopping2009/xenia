@@ -9,6 +9,7 @@
 
 #include "xenia/cpu/processor.h"
 
+#include <algorithm>
 #include <chrono>
 
 #include "xenia/base/assert.h"
@@ -24,6 +25,7 @@
 #include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/threading.h"
+#include "xenia/cpu/backend/code_cache.h"
 #include "xenia/cpu/breakpoint.h"
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/export_resolver.h"
@@ -34,6 +36,12 @@
 #include "xenia/cpu/thread.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/cpu/xex_module.h"
+
+#if XE_PLATFORM_WIN32
+#include "xenia/base/platform_win.h"
+// After windows.h.
+#include <tlhelp32.h>
+#endif  // XE_PLATFORM_WIN32
 
 // TODO(benvanik): based on compiler support
 #include "xenia/cpu/backend/x64/x64_backend.h"
@@ -53,6 +61,12 @@ DEFINE_int32(log_thread_stacks_interval, 0,
              "call stack's guest addresses) - for finding where a title that "
              "hangs is stuck. 0 to not.",
              "CPU");
+DEFINE_string(watch_guest_writes, "",
+              "Guest addresses (hex, comma-separated, up to 4) to watch with "
+              "hardware breakpoints, logging every write to the 8 bytes at "
+              "each (rounded down to 8) - what wrote it and the value - for "
+              "finding what corrupts a title's memory. Empty for none.",
+              "CPU");
 DEFINE_bool(break_on_start, false, "Break into the debugger on startup.",
             "CPU");
 
@@ -151,13 +165,21 @@ bool Processor::Setup(std::unique_ptr<backend::Backend> backend) {
   if (code_cache) {
     stack_walker_ = StackWalker::Create(code_cache);
   }
-  if (stack_walker_ && cvars::log_thread_stacks_interval > 0) {
-    stack_sampler_ = std::make_unique<std::thread>([this]() {
-      auto interval = std::chrono::seconds(cvars::log_thread_stacks_interval);
+  bool watching = StartWriteWatches(memory_);
+  if (stack_walker_ &&
+      (cvars::log_thread_stacks_interval > 0 || watching)) {
+    stack_sampler_ = std::make_unique<std::thread>([this, watching]() {
+      auto interval =
+          std::chrono::seconds(std::max(cvars::log_thread_stacks_interval, 1));
       auto next = std::chrono::steady_clock::now() + interval;
       while (!stack_sampler_stop_) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        if (std::chrono::steady_clock::now() < next) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (watching) {
+          ArmWriteWatches();
+          LogWriteWatchHits();
+        }
+        if (cvars::log_thread_stacks_interval <= 0 ||
+            std::chrono::steady_clock::now() < next) {
           continue;
         }
         next += interval;
@@ -895,6 +917,260 @@ void Processor::UpdateThreadExecutionStates(
         frame.name[xe::countof(frame.name) - 1] = 0;
       }
     }
+  }
+}
+
+// --watch_guest_writes: hardware data breakpoints (the debug registers, so
+// at most four) on guest addresses, in every thread of the process - guest
+// code and Xenia's own threads (GPU, audio) alike - logging each write: what
+// wrote (the guest code, or the Xenia function) and the value after it.
+namespace {
+struct WriteWatchHit {
+  uint64_t host_pc;
+  uint64_t value;
+  uint32_t address;
+  uint32_t host_thread_id;
+  // The host call stack at the write (for writes from Xenia's own code).
+  uint64_t stack[12];
+  uint32_t stack_count;
+};
+constexpr uint32_t kMaxWriteWatchHits = 4096;
+WriteWatchHit write_watch_hits[kMaxWriteWatchHits];
+std::atomic<uint32_t> write_watch_hit_count{0};
+uint32_t write_watch_logged = 0;
+uint32_t write_watch_guest[4];
+uint8_t* write_watch_host[4];
+int write_watch_count = 0;
+std::vector<uint32_t> write_watch_armed_threads;
+
+#if XE_PLATFORM_WIN32
+LONG CALLBACK WriteWatchExceptionHandler(PEXCEPTION_POINTERS ex_info) {
+  if (ex_info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  auto context = ex_info->ContextRecord;
+  DWORD64 triggered = context->Dr6 & 0xF;
+  if (!triggered) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  for (int i = 0; i < write_watch_count; ++i) {
+    if (!(triggered & (DWORD64(1) << i))) {
+      continue;
+    }
+    uint32_t n = write_watch_hit_count.fetch_add(1);
+    if (n < kMaxWriteWatchHits) {
+      auto& hit = write_watch_hits[n];
+      hit.host_pc = context->Rip;
+      hit.address = write_watch_guest[i];
+      std::memcpy(&hit.value, write_watch_host[i], 8);
+      hit.host_thread_id = GetCurrentThreadId();
+      // Unwound from the exception's context: the writer and its callers.
+      hit.stack_count = 0;
+      CONTEXT unwind = *context;
+      for (; hit.stack_count < xe::countof(hit.stack); ++hit.stack_count) {
+        hit.stack[hit.stack_count] = unwind.Rip;
+        DWORD64 image_base;
+        auto entry = RtlLookupFunctionEntry(unwind.Rip, &image_base, nullptr);
+        if (!entry) {
+          // A leaf function: the return address is on top of the stack.
+          if (!unwind.Rsp) {
+            break;
+          }
+          unwind.Rip = *reinterpret_cast<DWORD64*>(unwind.Rsp);
+          unwind.Rsp += 8;
+        } else {
+          void* handler_data;
+          DWORD64 establisher_frame;
+          RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, unwind.Rip, entry,
+                           &unwind, &handler_data, &establisher_frame,
+                           nullptr);
+        }
+        if (!unwind.Rip) {
+          ++hit.stack_count;
+          break;
+        }
+      }
+    }
+  }
+  context->Dr6 = 0;
+  return EXCEPTION_CONTINUE_EXECUTION;
+}
+#endif  // XE_PLATFORM_WIN32
+}  // namespace
+
+bool Processor::StartWriteWatches(Memory* memory) {
+#if XE_PLATFORM_WIN32
+  std::string list = cvars::watch_guest_writes;
+  size_t start = 0;
+  while (start < list.size() && write_watch_count < 4) {
+    size_t end = list.find(',', start);
+    if (end == std::string::npos) {
+      end = list.size();
+    }
+    std::string item = list.substr(start, end - start);
+    start = end + 1;
+    if (item.empty()) {
+      continue;
+    }
+    // "p:" for a physical address, watched where Xenia's own physical memory
+    // accesses (the GPU, DMA-like copies) reach it rather than through a
+    // virtual view.
+    bool physical = item.rfind("p:", 0) == 0;
+    uint32_t address =
+        uint32_t(std::strtoul(item.c_str() + (physical ? 2 : 0), nullptr,
+                              16)) &
+        ~7u;
+    write_watch_guest[write_watch_count] = address;
+    write_watch_host[write_watch_count] =
+        physical ? memory->TranslatePhysical<uint8_t*>(address)
+                 : memory->TranslateVirtual<uint8_t*>(address);
+    XELOGI("Watching writes to {}{:08X}-{:08X}", physical ? "physical " : "",
+           address, address + 7);
+    ++write_watch_count;
+  }
+  if (!write_watch_count) {
+    return false;
+  }
+  AddVectoredExceptionHandler(1, WriteWatchExceptionHandler);
+  return true;
+#else
+  return false;
+#endif  // XE_PLATFORM_WIN32
+}
+
+void Processor::ArmWriteWatches() {
+#if XE_PLATFORM_WIN32
+  // Every thread of the process not armed yet (threads come and go).
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+  if (snapshot == INVALID_HANDLE_VALUE) {
+    return;
+  }
+  DWORD process_id = GetCurrentProcessId();
+  DWORD self_id = GetCurrentThreadId();
+  THREADENTRY32 entry;
+  entry.dwSize = sizeof(entry);
+  for (BOOL ok = Thread32First(snapshot, &entry); ok;
+       ok = Thread32Next(snapshot, &entry)) {
+    if (entry.th32OwnerProcessID != process_id ||
+        entry.th32ThreadID == self_id ||
+        std::find(write_watch_armed_threads.begin(),
+                  write_watch_armed_threads.end(),
+                  entry.th32ThreadID) != write_watch_armed_threads.end()) {
+      continue;
+    }
+    HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                                   THREAD_SET_CONTEXT,
+                               FALSE, entry.th32ThreadID);
+    if (!thread) {
+      continue;
+    }
+    if (SuspendThread(thread) != DWORD(-1)) {
+      CONTEXT context = {};
+      context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+      if (GetThreadContext(thread, &context)) {
+        DWORD64* registers[] = {&context.Dr0, &context.Dr1, &context.Dr2,
+                                &context.Dr3};
+        DWORD64 control = 0;
+        for (int i = 0; i < write_watch_count; ++i) {
+          *registers[i] = DWORD64(write_watch_host[i]);
+          // Local enable; break on writes (01); 8 bytes long (10).
+          control |= DWORD64(1) << (2 * i);
+          control |= DWORD64(0b01) << (16 + 4 * i);
+          control |= DWORD64(0b10) << (18 + 4 * i);
+        }
+        context.Dr7 = control;
+        if (SetThreadContext(thread, &context)) {
+          write_watch_armed_threads.push_back(entry.th32ThreadID);
+          XELOGI("Write watch: armed thread {:X} ({} so far)",
+                 entry.th32ThreadID, write_watch_armed_threads.size());
+        }
+      }
+      ::ResumeThread(thread);
+    }
+    CloseHandle(thread);
+  }
+  CloseHandle(snapshot);
+#endif  // XE_PLATFORM_WIN32
+}
+
+void Processor::LogWriteWatchHits() {
+  uint32_t count =
+      std::min(write_watch_hit_count.load(), kMaxWriteWatchHits);
+  for (; write_watch_logged < count; ++write_watch_logged) {
+    const auto& hit = write_watch_hits[write_watch_logged];
+    // The pc is just past the writing instruction - in guest code, that maps
+    // to the guest instruction; otherwise name Xenia's function.
+    std::string where;
+    auto code_cache = backend_ ? backend_->code_cache() : nullptr;
+    auto function = code_cache ? code_cache->LookupFunction(hit.host_pc)
+                               : nullptr;
+    if (function) {
+      where = fmt::format("guest {:08X} [function {:08X}]",
+                          function->MapMachineCodeToGuestAddress(hit.host_pc),
+                          function->address());
+    } else if (stack_walker_) {
+      uint64_t pc = hit.host_pc;
+      StackFrame frame;
+      stack_walker_->ResolveStack(&pc, &frame, 1);
+      where = fmt::format("host {:016X} {}", hit.host_pc,
+                          frame.host_symbol.name);
+    }
+    auto bytes = reinterpret_cast<const uint8_t*>(&hit.value);
+    XELOGI("Write {}: {:08X} = {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X}"
+           " by {} (host thread {:X})",
+           write_watch_logged, hit.address, bytes[0], bytes[1], bytes[2],
+           bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], where,
+           hit.host_thread_id);
+#if XE_PLATFORM_WIN32
+    // The writing thread's name, and its call stack.
+    std::string thread_name;
+    if (HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE,
+                                   hit.host_thread_id)) {
+      PWSTR description = nullptr;
+      if (SUCCEEDED(GetThreadDescription(thread, &description)) &&
+          description) {
+        thread_name = xe::to_utf8(std::u16string(
+            reinterpret_cast<const char16_t*>(description)));
+        LocalFree(description);
+      }
+      CloseHandle(thread);
+    }
+    std::string stack;
+    for (uint32_t i = 0; i < hit.stack_count; ++i) {
+      uint64_t pc = hit.stack[i];
+      auto frame_function =
+          code_cache ? code_cache->LookupFunction(pc) : nullptr;
+      if (frame_function) {
+        stack += fmt::format(
+            "\n    guest {:08X}",
+            frame_function->MapMachineCodeToGuestAddress(pc));
+        continue;
+      }
+      StackFrame frame = {};
+      if (stack_walker_) {
+        stack_walker_->ResolveStack(&pc, &frame, 1);
+      }
+      HMODULE module = nullptr;
+      char module_name[MAX_PATH] = "?";
+      if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             reinterpret_cast<LPCSTR>(pc), &module)) {
+        GetModuleFileNameA(module, module_name, MAX_PATH);
+      }
+      const char* base_name = std::strrchr(module_name, '\\');
+      stack += fmt::format("\n    {}+{:X} {}",
+                           base_name ? base_name + 1 : module_name,
+                           pc - reinterpret_cast<uint64_t>(module),
+                           frame.host_symbol.name);
+    }
+    XELOGI("  thread \"{}\":{}", thread_name, stack);
+#endif  // XE_PLATFORM_WIN32
+  }
+  if (write_watch_hit_count.load() > kMaxWriteWatchHits &&
+      write_watch_logged == kMaxWriteWatchHits) {
+    XELOGI("Write watch: stopped recording after {} writes",
+           kMaxWriteWatchHits);
+    ++write_watch_logged;
   }
 }
 

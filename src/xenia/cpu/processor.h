@@ -210,6 +210,11 @@ class Processor {
   // the --log_thread_stacks_interval sampler, for finding where a hung title
   // is stuck.
   void LogThreadStacks();
+  // The --watch_guest_writes data breakpoints: set up, (re)arm in threads,
+  // log what they caught.
+  static bool StartWriteWatches(Memory* memory);
+  void ArmWriteWatches();
+  void LogWriteWatchHits();
   std::unique_ptr<std::thread> stack_sampler_;
   std::atomic<bool> stack_sampler_stop_{false};
 

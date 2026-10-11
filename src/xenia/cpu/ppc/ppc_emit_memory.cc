@@ -11,8 +11,18 @@
 
 #include <stddef.h>
 #include "xenia/base/assert.h"
+#include "xenia/base/cvar.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/ppc/ppc_hir_builder.h"
+
+DEFINE_bool(dcbz_128, false,
+            "Make dcbz zero a whole 128-byte cache line (the Xbox 360 CPU's) "
+            "rather than 32 bytes. For games whose own memset steps 128 "
+            "bytes per dcbz - MLB 2K12's, shared with its PS3 version - and "
+            "otherwise leaves 96 of every 128 bytes uncleared. Set it in "
+            "that game's own config: games expecting 32 bytes would lose "
+            "data.",
+            "CPU");
 
 namespace xe {
 namespace cpu {
@@ -1109,9 +1119,9 @@ int InstrEmit_dcbz(PPCHIRBuilder& f, const InstrData& i) {
   // EA <- (RA) + (RB)
   // memset(EA & ~31, 0, 32)
   Value* ea = CalculateEA_0(f, i.X.RA, i.X.RB);
-  // dcbz - 32 byte set
-  int block_size = 32;
-  int address_mask = ~31;
+  // dcbz - 32 byte set (or a whole 128-byte line with --dcbz_128).
+  int block_size = cvars::dcbz_128 ? 128 : 32;
+  int address_mask = ~(block_size - 1);
   f.Memset(f.And(ea, f.LoadConstantInt64(address_mask)), f.LoadZeroInt8(),
            f.LoadConstantInt64(block_size));
   return 0;
