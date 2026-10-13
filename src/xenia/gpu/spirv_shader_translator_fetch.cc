@@ -227,9 +227,11 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
 
     case xenos::VertexFormat::k_16_16_FLOAT:
     case xenos::VertexFormat::k_16_16_16_16_FLOAT: {
-      // FIXME(Triang3l): This converts from GLSL float16 with NaNs instead of
-      // Xbox 360 float16 with extended range. However, haven't encountered
-      // games relying on that yet.
+      // Xbox 360 float16 has no infinity and NaN - the maximum exponent is a
+      // normal one, extending the range to +-131008 (Madden NFL 07 marks
+      // untextured menu quads with 0xFC00 texture coordinates and compares them
+      // to -65536.0). For such values, convert with the exponent lowered by 1
+      // and double the result.
       spv::Id word_needed_component_values[2] = {};
       for (uint32_t i = 0; i < 2; ++i) {
         uint32_t word_needed_components =
@@ -244,9 +246,45 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
         } else {
           word = words;
         }
+        spv::Id word_exponents = builder_->createBinOp(
+            spv::OpBitwiseAnd, type_uint_, word,
+            builder_->makeUintConstant(0x7C007C00));
+        spv::Id low_exponent_max = builder_->createBinOp(
+            spv::OpIEqual, type_bool_,
+            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
+                                  word_exponents,
+                                  builder_->makeUintConstant(0xFFFF)),
+            builder_->makeUintConstant(0x7C00));
+        spv::Id high_exponent_max = builder_->createBinOp(
+            spv::OpUGreaterThanEqual, type_bool_, word_exponents,
+            builder_->makeUintConstant(0x7C000000));
+        word = builder_->createBinOp(
+            spv::OpISub, type_uint_, word,
+            builder_->createBinOp(
+                spv::OpBitwiseOr, type_uint_,
+                builder_->createTriOp(spv::OpSelect, type_uint_,
+                                      low_exponent_max,
+                                      builder_->makeUintConstant(0x400),
+                                      const_uint_0_),
+                builder_->createTriOp(spv::OpSelect, type_uint_,
+                                      high_exponent_max,
+                                      builder_->makeUintConstant(0x4000000),
+                                      const_uint_0_)));
         word = builder_->createUnaryBuiltinCall(type_float2_,
                                                 ext_inst_glsl_std_450_,
                                                 GLSLstd450UnpackHalf2x16, word);
+        spv::Id const_float_2 = builder_->makeFloatConstant(2.0f);
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(
+            builder_->createTriOp(spv::OpSelect, type_float_, low_exponent_max,
+                                  const_float_2, const_float_1_));
+        id_vector_temp_.push_back(
+            builder_->createTriOp(spv::OpSelect, type_float_,
+                                  high_exponent_max, const_float_2,
+                                  const_float_1_));
+        word = builder_->createBinOp(
+            spv::OpFMul, type_float2_, word,
+            builder_->createCompositeConstruct(type_float2_, id_vector_temp_));
         if (word_needed_components != 0b11) {
           // If only one of two components is needed, extract it.
           word = builder_->createCompositeExtract(

@@ -405,15 +405,30 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
   } else {
     switch (instr.attributes.data_format) {
       case xenos::VertexFormat::k_16_16_FLOAT:
-      case xenos::VertexFormat::k_16_16_16_16_FLOAT:
-        // FIXME(Triang3l): This converts from D3D10+ float16 with NaNs instead
-        // of Xbox 360 float16 with extended range. However, haven't encountered
-        // games relying on that yet.
+      case xenos::VertexFormat::k_16_16_16_16_FLOAT: {
         a_.OpUBFE(result_unpacked_dest, dxbc::Src::LU(16),
                   dxbc::Src::LU(0, 16, 0, 16),
                   dxbc::Src::R(system_temp_result_, 0b01010000));
+        // Xbox 360 float16 has no infinity and NaN - the maximum exponent is a
+        // normal one, extending the range to +-131008 (Madden NFL 07 marks
+        // untextured menu quads with 0xFC00 texture coordinates and compares
+        // them to -65536.0). For such values, convert with the exponent lowered
+        // by 1 and double the result.
+        uint32_t exponent_max_temp = PushSystemTemp();
+        dxbc::Dest exponent_max_dest(
+            dxbc::Dest::R(exponent_max_temp, used_format_components));
+        dxbc::Src exponent_max_src(dxbc::Src::R(exponent_max_temp));
+        a_.OpAnd(exponent_max_dest, result_src, dxbc::Src::LU(0x7C00));
+        a_.OpIEq(exponent_max_dest, exponent_max_src, dxbc::Src::LU(0x7C00));
+        // ~0 * 0x400 + value = value - 0x400.
+        a_.OpIMAd(result_unpacked_dest, exponent_max_src,
+                  dxbc::Src::LU(0x400), result_src);
         a_.OpF16ToF32(result_unpacked_dest, result_src);
-        break;
+        a_.OpAnd(exponent_max_dest, exponent_max_src, result_src);
+        a_.OpAdd(result_unpacked_dest, result_src, exponent_max_src);
+        // Release exponent_max_temp.
+        PopSystemTemp();
+      } break;
       case xenos::VertexFormat::k_32:
       case xenos::VertexFormat::k_32_32:
       case xenos::VertexFormat::k_32_32_32_32:
