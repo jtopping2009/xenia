@@ -220,6 +220,8 @@ class XmaContext {
   // size_t partial_frame_offset_bits_ = 0;  // blah internal don't use this
   // std::vector<uint8_t> partial_frame_buffer_;
   uint32_t packets_skip_ = 0;
+  // Bytes written to the output buffer by the last Decode.
+  uint32_t output_bytes_written_ = 0;
 
   // bool split_frame_pending_ = false;
   uint32_t split_frame_len_ = 0;

@@ -101,6 +101,17 @@ bool XmaContext::Work() {
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
   XMA_CONTEXT_DATA data(context_ptr);
   Decode(&data);
+  // A filled output buffer has its write offset back at the read offset, the
+  // same as an empty one - games tell them apart by the output buffer being
+  // invalidated when full (the game will kick us again with a new output
+  // buffer later). Decode has several ways out once the input buffer runs out,
+  // and this used to be checked at only one - Madden NFL 07 saw a full buffer
+  // as an empty but still valid one and waited forever for output.
+  // It's important that we only invalidate this if we actually wrote to it!!
+  if (output_bytes_written_ &&
+      data.output_buffer_write_offset == data.output_buffer_read_offset) {
+    data.output_buffer_valid = 0;
+  }
   data.Store(context_ptr);
   return true;
 }
@@ -291,6 +302,7 @@ static void dump_raw(AVFrame* frame, int id) {
 
 void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   SCOPE_profile_cpu_f("apu");
+  output_bytes_written_ = 0;
 
   // What I see:
   // XMA outputs 2 bytes per sample
@@ -585,25 +597,28 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     split_frame_len_partial_ = 0;
     split_frame_padding_start_ = 0;
 
+    // A frame FFmpeg can't decode is output as silence and skipped like a
+    // decoded one. Returning without consuming it left the context retrying
+    // the same frame forever with no output - Madden NFL 07's audio thread
+    // waits for that output, and with the audio thread stuck, the game's audio
+    // command queue overflowed into its own header and the game crashed early
+    // in a match.
+    bool decoded = true;
     auto ret = avcodec_send_packet(av_context_, av_packet_);
     if (ret < 0) {
       XELOGE("XmaContext {}: Error sending packet for decoding", id());
-      // TODO bail out
-      assert_always();
+      decoded = false;
+    } else {
+      ret = avcodec_receive_frame(av_context_, av_frame_);
+      if (ret < 0) {
+        XELOGE("XmaContext {}: Error during decoding - outputting silence",
+               id());
+        decoded = false;
+      }
     }
-    ret = avcodec_receive_frame(av_context_, av_frame_);
-    /*
-    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-      // TODO AVERROR_EOF???
-      break;
-    else
-    */
-    if (ret < 0) {
-      XELOGE("XmaContext {}: Error during decoding", id());
-      assert_always();
-      return;  // TODO bail out
+    if (!decoded) {
+      avcodec_flush_buffers(av_context_);
     }
-    assert_true(ret == 0);
 
     {
       // copy over 1 frame
@@ -618,7 +633,9 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
       // From bad data FFmpeg can return a frame without every channel (or
       // short) - silence rather than reading past it (Spider-Man 3 crashed
       // here a minute or so into the game).
-      if (av_frame_->data[0] &&
+      if (!decoded) {
+        std::memset(raw_frame_.data(), 0, raw_frame_.size());
+      } else if (av_frame_->data[0] &&
           (!data->is_stereo || av_frame_->data[1]) &&
           av_frame_->nb_samples >= int(kSamplesPerFrame)) {
         ConvertFrame((const uint8_t**)av_frame_->data, bool(data->is_stereo),
@@ -636,6 +653,7 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
       auto byte_count = kBytesPerFrameChannel << data->is_stereo;
       assert_true(output_remaining_bytes >= byte_count);
       output_rb.Write(raw_frame_.data(), byte_count);
+      output_bytes_written_ += byte_count;
       output_remaining_bytes -= byte_count;
       data->output_buffer_write_offset = output_rb.write_offset() / 256;
 
@@ -695,11 +713,8 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   // assert_true((split_frame_len_ != 0) == (data->input_buffer_read_offset ==
   // 0));
 
-  // The game will kick us again with a new output buffer later.
-  // It's important that we only invalidate this if we actually wrote to it!!
-  if (output_rb.write_offset() == output_rb.read_offset()) {
-    data->output_buffer_valid = 0;
-  }
+  // Whether the output buffer is full is checked in Work, after every way out
+  // of here.
 }
 
 size_t XmaContext::GetNextFrame(uint8_t* block, size_t size,

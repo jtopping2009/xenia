@@ -27,6 +27,8 @@
 #include "xenia/base/platform.h"
 #include "xenia/base/string.h"
 #include "xenia/base/string_buffer.h"
+#include "xenia/base/string_util.h"
+#include "xenia/base/utf8.h"
 #include "xenia/cpu/backend/code_cache.h"
 #include "xenia/cpu/backend/null_backend.h"
 #include "xenia/cpu/cpu_flags.h"
@@ -69,6 +71,11 @@ DEFINE_string(guest_date, "",
               "today, for games that go wrong on today's date - sports games "
               "whose seasons follow the calendar. Best set in a game's own "
               "config (config\\<title id>.config.toml). Empty for today.",
+              "General");
+DEFINE_string(crash_dump_code, "",
+              "Extra guest code ranges (hex start-end, comma-separated) to "
+              "disassemble in crash dumps, for reading the callers of the "
+              "crashing code.",
               "General");
 DEFINE_string(
     launch_module, "",
@@ -673,6 +680,19 @@ static void DumpCrashContext(Memory* memory, Exception* ex,
   if (uint32_t(context->lr) != 0 && uint32_t(context->lr) != pc) {
     uint32_t lr = uint32_t(context->lr);
     disassemble("Code at lr", lr - 0x20, lr + 0x10, lr);
+  }
+  for (std::string_view range : xe::utf8::split(cvars::crash_dump_code, ",")) {
+    size_t dash = range.find('-');
+    if (dash == std::string_view::npos) {
+      continue;
+    }
+    uint32_t start = xe::string_util::from_string<uint32_t>(
+        range.substr(0, dash), true);
+    uint32_t end =
+        xe::string_util::from_string<uint32_t>(range.substr(dash + 1), true);
+    if (end > start && end - start <= 0x4000) {
+      disassemble("Code range", start, end, 0);
+    }
   }
 
   // What the registers point at, where that's readable memory.
